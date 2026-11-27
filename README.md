@@ -1,10 +1,15 @@
 # Geostatex
 
+[![CI](https://github.com/CountlinkX-Solutions/geostatex/actions/workflows/ci.yml/badge.svg)](https://github.com/CountlinkX-Solutions/geostatex/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/geostatex.svg)](https://hex.pm/packages/geostatex)
+[![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/geostatex)
+[![License](https://img.shields.io/badge/license-LGPL--3.0-blue.svg)](LICENSE)
+
 Geostatistics for Elixir: experimental variograms, theoretical variogram models and their
 fitting, and kriging, with a pure-Rust core behind a thin Rustler NIF layer.
 
-Geostatex ports the functionality of two mature Python libraries and verifies its results against
-them:
+Geostatex ports the functionality of mature geostatistics libraries and verifies its results
+against them:
 
 - [scikit-gstat](https://github.com/mmaelicke/scikit-gstat) for variograms: lag binning,
   estimators, models, fitting, directional and space-time variograms;
@@ -22,7 +27,8 @@ random step takes a `seed`.
 
 ## Status
 
-Latest release 0.5.0 (see the [changelog](CHANGELOG.md)). The plan and the milestones are in [odd/tasks/planning.md](https://github.com/CountlinkX-Solutions/geostatex/blob/main/odd/tasks/planning.md).
+The API is complete for the milestones below and still pre-1.0: minor versions may change it
+(see the [changelog](CHANGELOG.md)).
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -78,16 +84,45 @@ Latest release 0.5.0 (see the [changelog](CHANGELOG.md)). The plan and the miles
 Notebooks with Python cells install their Python packages with uv through Pythonx the first time.
 
 They use `Geostatex.GeoFrame`, the adapter to
-[GeoFrame](https://github.com/CountlinkX-Solutions/geoframe) (a private sibling project, so they
-are not run in CI); see each notebook's setup.
+[GeoFrame](https://github.com/CountlinkX-Solutions/geoframe), geospatial data frames for Elixir;
+see each notebook's setup.
 
 ## Install
 
-Geostatex builds its NIF from source: you need a Rust toolchain (1.91 or newer).
+```elixir
+def deps do
+  [
+    {:geostatex, "~> 0.6"}
+  ]
+end
+```
+
+The Hex package downloads a precompiled NIF for the common platforms (listed below), so no Rust
+toolchain is needed. On any other platform, or to build it yourself, add
+`{:rustler, "~> 0.38", runtime: false}` to your dependencies, install Rust 1.91 or newer and set
+`GEOSTATEX_BUILD=1`.
+
+Nx tensors and Explorer series are accepted as inputs when `:nx` and `:explorer` are among your
+dependencies; plain lists always are.
+
+## Quick start
 
 ```elixir
-{:geostatex, github: "CountlinkX-Solutions/geostatex", tag: "v0.5.0"}
+points = [{0, 0}, {1, 0}, {2, 0}, {3, 0}, {0, 1}, {1, 1}, {2, 1}, {3, 1}]
+values = [1.0, 2.0, 4.0, 3.0, 1.5, 2.5, 3.5, 3.0]
+
+# Experimental variogram with a fitted spherical model.
+variogram = Geostatex.Variogram.new(points, values, model: :spherical, n_lags: 3)
+variogram.experimental
+
+# Ordinary kriging: estimates and kriging variances at new points.
+kriging = Geostatex.Kriging.ordinary(points, values, variogram_model: :spherical)
+{estimates, variances} = Geostatex.Kriging.execute(kriging, :points, [0.5, 2.5], [0.5, 0.5])
 ```
+
+The [notebooks](#notebooks) work through complete cases on real data, and
+[docs/parity.md](docs/parity.md) lists what is ported from each reference library and every
+deviation.
 
 ### Source build versus precompiled NIF
 
@@ -160,9 +195,6 @@ dry run, on pull requests that touch the build inputs).
    `checksum-Elixir.Geostatex.Native.exs`, which the Hex package then includes.
 3. `mix hex.build` to inspect the package, then `mix hex.publish`.
 
-`v0.1.0` predates the workflow and has no precompiled artifacts; they start with `v0.2.0`.
-While the repository is private, release downloads need authentication, so precompiled NIFs
-only become usable once the repository (or at least its releases) is public.
 
 ## License
 

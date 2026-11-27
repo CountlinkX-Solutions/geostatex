@@ -14,7 +14,8 @@ defmodule Geostatex.ReleaseTest do
     test "ships the native sources, lockfile, changelog and legal files", %{files: files} do
       for entry <-
             ~w(lib native/geostatex_core/src native/geostatex_native/src Cargo.toml Cargo.lock
-               CHANGELOG.md LICENSE COPYING LICENSES NOTICE README.md mix.exs) do
+               .cargo/config.toml CHANGELOG.md LICENSE COPYING LICENSES NOTICE README.md
+               mix.exs) do
         assert entry in files, "#{entry} missing from package files"
       end
 
@@ -36,6 +37,25 @@ defmodule Geostatex.ReleaseTest do
 
         assert File.read!(Path.join(@root, "NOTICE")) =~ name
       end
+    end
+
+    test "keeps build and test tools out of the runtime dependencies of users" do
+      deps = Map.new(Mix.Project.config()[:deps], &{elem(&1, 0), List.last(Tuple.to_list(&1))})
+
+      # With a precompiled NIF nobody needs Rustler; a source build asks for it.
+      assert deps[:rustler][:optional]
+      # Only the oracle helper under test/support decodes JSON.
+      assert deps[:jason][:optional]
+    end
+
+    test "links the changelog and installs from Hex in the README" do
+      links = Mix.Project.config()[:package][:links]
+      assert links["Changelog"] =~ "CHANGELOG.md"
+
+      readme = File.read!(Path.join(@root, "README.md"))
+      assert readme =~ ~s({:geostatex, "~> 0.6"})
+      refute readme =~ "private"
+      refute readme =~ "odd/"
     end
 
     test "every package entry exists, so mix hex.build cannot report missing files", %{

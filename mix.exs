@@ -12,7 +12,8 @@ defmodule Geostatex.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Geostatistics for Elixir (variograms, kriging), backed by a Rust core.",
+      description:
+        "Geostatistics for Elixir: variograms, kriging and Gaussian random fields, backed by a Rust core.",
       name: "Geostatex",
       source_url: @source_url,
       package: package(),
@@ -59,6 +60,7 @@ defmodule Geostatex.MixProject do
         ],
         "docs/architecture.md": [title: "Architecture"],
         "docs/parity.md": [title: "Parity"],
+        "CONTRIBUTING.md": [title: "Contributing"],
         LICENSE: [title: "License (LGPL-3.0)"],
         COPYING: [title: "GNU General Public License"],
         NOTICE: [title: "Notice"]
@@ -77,11 +79,14 @@ defmodule Geostatex.MixProject do
   defp package do
     [
       licenses: ["LGPL-3.0-only"],
-      links: %{"GitHub" => @source_url},
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+      },
       files:
         ~w(lib native/geostatex_core/src native/geostatex_core/Cargo.toml
            native/geostatex_native/src native/geostatex_native/Cargo.toml
-           Cargo.toml Cargo.lock mix.exs docs README.md CHANGELOG.md LICENSE COPYING LICENSES NOTICE) ++
+           .cargo/config.toml Cargo.toml Cargo.lock mix.exs docs README.md CHANGELOG.md LICENSE COPYING LICENSES NOTICE) ++
           checksum_files()
     ]
   end
@@ -103,21 +108,23 @@ defmodule Geostatex.MixProject do
 
   defp deps do
     [
-      # The crate is rustler 0.39; Hex has the Mix package 0.38.0, which builds it (as in Spatex).
-      {:rustler, "~> 0.38", runtime: false},
+      # Only a source build needs it (Geostatex.Native): optional for users of the precompiled NIF.
+      # The crate is rustler 0.39; Hex has the Mix package 0.38.0, which builds it.
+      {:rustler, "~> 0.38", runtime: false, optional: true},
       {:rustler_precompiled, "~> 0.8"},
       {:nx, "~> 0.10 or ~> 1.0", optional: true},
       {:explorer, "~> 0.13", optional: true},
       {:stream_data, "~> 1.4", only: [:dev, :test]},
-      # The oracle helper decodes fixtures with it.
-      {:jason, "~> 1.4"},
+      # Only the oracle helper (test/support) decodes fixtures with it. Rustler needs it in every
+      # environment, so it cannot be test-only here; optional keeps it away from users.
+      {:jason, "~> 1.4", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false}
     ] ++ geoframe_dep()
   end
 
-  # GeoFrame is a private sibling project, so CI cannot fetch it and the lock never lists it:
-  # the dependency exists only when GEOSTATEX_GEOFRAME_PATH points at a checkout.
+  # GeoFrame is not on Hex yet, so CI cannot fetch it and the lock never lists it: the
+  # dependency exists only when GEOSTATEX_GEOFRAME_PATH points at a checkout.
   # Geostatex.GeoFrame calls it at runtime, so nothing here is needed to compile Geostatex.
   defp geoframe_dep do
     case System.get_env("GEOSTATEX_GEOFRAME_PATH") do
