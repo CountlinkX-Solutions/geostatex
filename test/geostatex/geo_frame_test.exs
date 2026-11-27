@@ -53,7 +53,7 @@ defmodule Geostatex.GeoFrameTest do
   end
 
   test "geographic frames", ctx do
-    geo = GDF.set_crs(ctx.frame, "EPSG:4326")
+    geo = GDF.set_crs(ctx.frame, "EPSG:4326", allow_override: true)
 
     assert_raise ArgumentError, ~r/geographic/, fn ->
       Geostatex.GeoFrame.variogram(geo, "log_zinc")

@@ -6,7 +6,22 @@ All notable changes to Geostatex are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-26
+
+The first public release, and the first on Hex. Versions 0.1.0 to 0.5.0 were released privately;
+their entries below are kept as the history of the features.
+
+### Added
+- Hex package with precompiled NIFs (Linux glibc and musl, macOS, Windows; NIF 2.16 and 2.17): no
+  Rust toolchain is needed on those platforms.
+- `CONTRIBUTING.md`, `SECURITY.md` and the licence texts of the reference libraries.
+
 ### Changed
+- `rustler` and `jason` are optional dependencies. A source build (`GEOSTATEX_BUILD=1`, a
+  checkout or a Git dependency) needs `{:rustler, "~> 0.38", runtime: false}` in your own
+  dependencies.
+- The GeoFrame adapter is tested against GeoFrame 0.3.3 from Hex, and the notebooks install it
+  from there.
 - **Licence: LGPL-3.0-only instead of Apache-2.0.** Simple kriging, the random fields and the
   GSTools covariance models were ported from the source of GSTools (LGPL-3.0), so the library is
   a derivative work of it. `NOTICE` now states the origin of each part, and the licence texts of
@@ -172,9 +187,5 @@ First release: the planned milestones M0 to M8 are complete.
 - Variogram fits bound the range by the last lag edge, empty lags included, as scikit-gstat
   does (they used the last non-empty lag).
 
-[Unreleased]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/CountlinkX-Solutions/geostatex/releases/tag/v0.1.0
+[Unreleased]: https://github.com/CountlinkX-Solutions/geostatex/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/CountlinkX-Solutions/geostatex/releases/tag/v0.6.0

@@ -1,17 +1,11 @@
 # Use case: XGBoost in Python, geostatistics in Elixir
 
 ```elixir
-geoframe_path =
-  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
-    Enum.find(
-      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
-      &(&1 && File.dir?(&1))
-    ) ||
-    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
-
 Mix.install([
   {:geostatex, path: Path.join(__DIR__, "..")},
-  {:geoframe, path: geoframe_path},
+  # A checkout builds the NIF from source, which needs Rustler and a Rust toolchain.
+  {:rustler, "~> 0.38", runtime: false},
+  {:geoframe, "~> 0.3.3"},
   {:explorer, "~> 0.13"},
   {:scholar, "~> 0.5"},
   {:pythonx, "~> 0.4.2"},
@@ -35,8 +29,7 @@ dependencies = [
 
 ## Setup
 
-> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
-> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+> Run this notebook from a checkout of Geostatex (it reads the data under `notebooks/data`):
 >
 > ```
 > livebook server notebooks/baltimore_xgboost_case.livemd
@@ -48,8 +41,7 @@ dependencies = [
 > elixir scripts/run_livemd.exs notebooks/baltimore_xgboost_case.livemd
 > ```
 >
-> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
-> `SPATEX_GEOFRAME_PATH`. The Python cells run through
+> The Python cells run through
 > [Pythonx](https://github.com/livebook-dev/pythonx), which installs the Python packages above
 > with uv the first time. Spanish version: `notebooks/es/caso_xgboost_baltimore.livemd`.
 
