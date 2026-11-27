@@ -1,0 +1,224 @@
+# Caso de uso: la renta de los estados de EE. UU. en el espacio y el tiempo, 1929-2009
+
+## Preparación
+
+> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
+> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame junto a Geostatex:
+> 
+> ```
+> livebook server notebooks/es/caso_renta_eeuu.livemd
+> ```
+> 
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+> 
+> ```
+> elixir scripts/run_livemd.exs notebooks/es/caso_renta_eeuu.livemd
+> ```
+> 
+> GeoFrame se toma de `GEOSTATEX_GEOFRAME_PATH`, de `../geoframe` junto a este repositorio o de
+> `SPATEX_GEOFRAME_PATH`. Versión en inglés: `notebooks/us_income_case.livemd`.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame (o pon geoframe junto a este repositorio)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "../..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## La pregunta
+
+En 1929 el más pobre de los 48 estados contiguos tenía una cuarta parte de la renta per cápita del
+más rico; en 2009 tenía más de la mitad. Los economistas regionales lo llaman **convergencia**. La
+geoestadística añade la mirada espacio-temporal: los estados se parecen a sus **vecinos** (una
+correlación espacial) y a su propio **pasado** (una temporal), y las dos pueden cambiar.
+
+Los datos son la renta personal per cápita de los 48 estados contiguos de cada año entre 1929 y
+2009 (Bureau of Economic Analysis, distribuidos con PySAL). Trabajamos con la renta **relativa** a
+la media de los 48 estados de cada año, lo que elimina la inflación y el crecimiento nacional. Nos
+preguntamos:
+
+1. ¿Se reduce con las décadas el **variograma** espacial de la renta relativa (convergencia), y
+   cambia su alcance?
+2. ¿Cómo decae la correlación a la vez en el **espacio y el tiempo** (un variograma
+   espacio-temporal)?
+3. ¿Hasta qué punto se puede **predecir** la renta de un estado a partir de sus vecinos, midiendo
+   las distancias sobre la esfera o sobre una proyección?
+
+## 1. Los estados y sus rentas
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias Geostatex.{SpaceTimeVariogram, Variogram}
+
+dir = Path.join([__DIR__, "..", "data", "us_income"])
+
+states =
+  dir
+  |> Path.join("us48.shp")
+  |> GeoFrame.read_file!()
+  |> GDF.set_crs("EPSG:4269")
+
+income = DF.from_csv!(Path.join(dir, "usjoin.csv"))
+years = Enum.map(1929..2009//10, &Integer.to_string/1)
+
+# Renta relativa a la media de los 48 estados, por década, en el orden de los polígonos.
+fips = states |> GDF.pull("STATE_FIPS") |> S.to_list() |> Enum.map(&String.to_integer/1)
+row_of = income["STATE_FIPS"] |> S.to_list() |> Enum.with_index() |> Map.new()
+
+relative =
+  for year <- years do
+    col = S.to_list(income[year])
+    mean = Enum.sum(col) / length(col)
+    Enum.map(fips, fn f -> Enum.at(col, row_of[f]) / mean end)
+  end
+
+states =
+  Enum.zip(years, relative)
+  |> Enum.reduce(states, fn {year, values}, acc -> GDF.put(acc, "rel_" <> year, values) end)
+
+%{estados: GDF.n_rows(states), decadas: years}
+```
+
+```elixir
+GeoFrame.Kino.deck(states, color: {"rel_1929", :viridis}, tooltip: ["STATE_NAME", "rel_1929", "rel_2009"])
+```
+
+```elixir
+GeoFrame.Kino.deck(states, color: {"rel_2009", :viridis}, tooltip: ["STATE_NAME", "rel_1929", "rel_2009"])
+```
+
+La renta relativa iba de 0,44 a 1,87 veces la media en 1929, y de 0,79 a 1,42 en 2009.
+
+## 2. El variograma espacial, década a década
+
+Los centroides de los estados proyectados a la proyección cónica equivalente de Albers para EE. UU.
+(EPSG:5070), en km:
+
+```elixir
+{xs, ys} = states |> GDF.to_crs("EPSG:5070") |> Geostatex.GeoFrame.points()
+km = Enum.zip(Enum.map(xs, &(&1 / 1000)), Enum.map(ys, &(&1 / 1000)))
+
+by_decade =
+  for {year, values} <- Enum.zip(years, relative) do
+    v = Variogram.new(km, values, n_lags: 10, maxlag: 0.5, model: :spherical, use_nugget: true)
+    %{anio: year, alcance_km: Enum.at(v.cof, 0), meseta: Enum.at(v.cof, 1), pepita: Enum.at(v.cof, 2), varianza: Enum.sum(Enum.map(values, &((&1 - 1) ** 2))) / 48}
+  end
+
+DF.new(by_decade)
+```
+
+```elixir
+VegaLite.new(width: 520, height: 260, title: "Meseta del variograma espacial y varianza de la renta relativa")
+|> VegaLite.data_from_values(for r <- by_decade, {k, v} <- [meseta: r.meseta, varianza: r.varianza], do: %{anio: r.anio, medida: Atom.to_string(k), valor: v})
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "anio", type: :ordinal, title: "año")
+|> VegaLite.encode_field(:y, "valor", type: :quantitative)
+|> VegaLite.encode_field(:color, "medida", type: :nominal)
+```
+
+La meseta del variograma espacial baja de 0,14 en 1929 a 0,006 en 2009, y la varianza de la renta
+relativa de 0,126 a 0,021: una convergencia fuerte, sobre todo antes de 1980. Hasta 1979 casi toda
+la variación tiene estructura espacial (efecto pepita cerca de 0, alcance de unos 1100 a 1400 km:
+regiones de estados ricos y pobres). Desde 1989 el efecto pepita es mayor que la meseta: las
+diferencias que quedan son más de estado a estado que regionales, y el alcance ajustado (unos
+2000 km) queda en el borde de las clases, mal determinado.
+
+## 3. El variograma espacio-temporal
+
+Todas las décadas juntas: cada par de estados en dos décadas se clasifica por su distancia y su
+desfase temporal (de 1 a 8 décadas), lo que da una malla de semivarianzas. Un modelo producto-suma
+combina los variogramas marginales espacial y temporal.
+
+```elixir
+values_by_state = relative |> Enum.zip_with(& &1)
+st = SpaceTimeVariogram.new(km, values_by_state, x_lags: 8, maxlag: 0.6, model: :product_sum)
+
+%{
+  alcance_espacial_km: Enum.at(st.x_marginal.cof, 0),
+  alcance_temporal_decadas: Enum.at(st.t_marginal.cof, 0),
+  mesetas: st.sills,
+  k_producto_suma: st.cof
+}
+```
+
+```elixir
+cells =
+  for {row, xb} <- Enum.zip(st.experimental, st.xbins), {g, tb} <- Enum.zip(row, st.tbins), g != :nan,
+      do: %{distancia_km: round(xb), decadas: round(tb), gamma: g}
+
+VegaLite.new(width: 420, height: 300, title: "Semivarianza espacio-temporal de la renta relativa")
+|> VegaLite.data_from_values(cells)
+|> VegaLite.mark(:rect)
+|> VegaLite.encode_field(:x, "distancia_km", type: :ordinal, title: "distancia (km, borde superior)")
+|> VegaLite.encode_field(:y, "decadas", type: :ordinal, title: "desfase (décadas)")
+|> VegaLite.encode_field(:color, "gamma", type: :quantitative)
+```
+
+La marginal espacial alcanza su meseta hacia los 1040 km y la temporal hacia 1,2 décadas: los
+estados se parecen a sus vecinos hasta unos mil kilómetros, y a su propia renta de la década
+anterior, mucho menos a la de dos décadas antes. Los coeficientes ajustados del producto-suma
+(`k1 = 0`) reducen el modelo a una suma ponderada de las dos marginales.
+
+## 4. Predecir un estado a partir de sus vecinos
+
+Kriging dejando uno fuera de la renta relativa de 2009: sobre la esfera (distancias de círculo
+máximo entre la longitud y la latitud de los centroides) y sobre la proyección de Albers.
+
+```elixir
+centroids = states |> GDF.to_crs("EPSG:4326")
+v2009 = List.last(relative)
+opts = [variogram_model: :spherical, nlags: 8]
+
+{lon, lat} = Geostatex.GeoFrame.points(centroids)
+sphere = Geostatex.Kriging.cross_validate(:ordinary, Enum.zip(lon, lat), v2009, opts ++ [coordinates_type: :geographic])
+plane = Geostatex.Kriging.cross_validate(:ordinary, km, v2009, opts)
+mean_only = :math.sqrt(Enum.sum(Enum.map(v2009, fn v -> ((48 - v) / 47 - v) ** 2 end)) / 48)
+
+DF.new(%{
+  modelo: ["media de los demás", "kriging, círculo máximo", "kriging, km de Albers"],
+  rmse: [mean_only, sphere.rmse, plane.rmse]
+})
+```
+
+Los estados que peor predicen sus vecinos:
+
+```elixir
+names = states |> GDF.pull("STATE_NAME") |> S.to_list()
+
+Enum.zip([names, v2009, sphere.predictions, sphere.residuals])
+|> Enum.sort_by(fn {_, _, _, r} -> -abs(r) end)
+|> Enum.take(6)
+|> Enum.map(fn {n, v, p, r} -> %{estado: n, relativa_2009: v, prediccion: p, residuo: r} end)
+|> DF.new()
+```
+
+El kriging predice la renta relativa de 2009 de un estado a partir de los demás con un RMSE de
+0,118, frente a 0,147 de la media de los demás: un 20 % mejor. Las distancias de círculo máximo y
+la proyección equivalente dan el mismo resultado a esta escala. Las peores predicciones son estados
+ricos entre vecinos más pobres (Connecticut, Massachusetts, Maryland, Nueva Jersey, Wyoming) y
+Maine, más pobre que sus vecinos de Nueva Inglaterra.
+
+## Qué hemos aprendido
+
+* Las rentas relativas de los estados convergieron con fuerza entre 1929 y 1979, y su patrón
+  regional (regiones ricas y pobres de unos mil kilómetros) se desvaneció con ello.
+* En el espacio y el tiempo a la vez, los estados se parecen a sus vecinos hasta unos mil
+  kilómetros y a su pasado reciente; una suma de los dos variogramas marginales lo describe.
+* El kriging a partir de los estados vecinos predice la renta de un estado mejor que la media
+  nacional; los mayores errores son estados que se distinguen de su región.
+
+Todas las funciones de Geostatex usadas aquí están verificadas contra scikit-gstat o PyKrige (ver
+la guía de paridad).

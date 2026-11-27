@@ -1,0 +1,279 @@
+# Use case: house prices in Baltimore
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/baltimore_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/baltimore_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. Spanish version: `notebooks/es/caso_precios_baltimore.livemd`.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The question
+
+What is a house worth where nothing was sold? Appraisers and price indices interpolate between
+sales, and geostatistics gives that interpolation a model: prices of nearby houses are related, and
+the variogram says how quickly the relation fades with distance. Part of the similarity comes from
+the houses themselves (big houses near big houses), part from the place.
+
+The data are 211 house sales of 1978 in Baltimore City and County (Dubin 1992, distributed with
+PySAL), with the price, the house's features and its location in a local planar grid. We ask:
+
+1. How far does the **spatial correlation** of prices reach?
+2. Does kriging **predict prices** at unsold locations better than a plain average, and does
+   knowing the **house features** improve it (universal kriging, judged by cross-validation)?
+3. What does the **price surface** look like?
+
+## 1. The sales
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales =
+  [__DIR__, "data", "baltimore", "baltim.shp"]
+  |> Path.join()
+  |> GeoFrame.read_file!()
+
+sales = GDF.put(sales, "log_price", sales |> GDF.pull("PRICE") |> S.log())
+data = GDF.data(sales)
+
+# The coordinates have no CRS. They match the Maryland State Plane (NAD27, EPSG:26785) in
+# thousands of US feet, which places the sales in Baltimore City and County; maps draw them that
+# way, the analysis keeps the map units (1 unit = 1000 ft, about 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+%{
+  sales: GDF.n_rows(sales),
+  median_price_k: S.median(data["PRICE"]),
+  x_range: {S.min(data["X"]), S.max(data["X"])},
+  y_range: {S.min(data["Y"]), S.max(data["Y"])}
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(on_map.(sales), color: {"PRICE", :viridis}, radius: 6, tooltip: ["PRICE", "SQFT", "AGE"])
+```
+
+Prices (median 40 thousand dollars of 1978) are skewed, so we model their logarithm. The
+coordinates span about 130 by 75 map units (about 40 by 23 km).
+
+## 2. The variogram of prices
+
+```elixir
+v = Geostatex.GeoFrame.variogram(sales, "log_price", n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+%{range: Enum.at(v.cof, 0), sill: Enum.at(v.cof, 1), nugget: Enum.at(v.cof, 2), nugget_share: Enum.at(v.cof, 2) / (Enum.at(v.cof, 1) + Enum.at(v.cof, 2))}
+```
+
+```elixir
+curve = for h <- Enum.map(0..60, &(&1 * Enum.max(v.bins) / 60)), do: %{lag: h, gamma: hd(Variogram.transform(v, [h]))}
+
+points =
+  for {b, e, n} <- Enum.zip([v.bins, v.experimental, v.bin_count]), e != :nan,
+      do: %{lag: b, gamma: e, pairs: n}
+
+VegaLite.new(width: 520, height: 300, title: "Variogram of log(price)")
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(points)
+  |> VegaLite.mark(:point, size: 60)
+  |> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distance (map units)")
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivariance")
+  |> VegaLite.encode_field(:tooltip, "pairs", type: :quantitative),
+  VegaLite.new()
+  |> VegaLite.data_from_values(curve)
+  |> VegaLite.mark(:line)
+  |> VegaLite.encode_field(:x, "lag", type: :quantitative)
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative)
+])
+```
+
+An exponential model reaches its sill (0.35) by about 40 map units (its effective range), with a
+nugget of 0.03. The **nugget** is the variation between houses next to each other: the
+differences between the houses themselves, which location cannot explain.
+
+Models compared on the same experimental variogram:
+
+```elixir
+for model <- [:spherical, :exponential, :gaussian] do
+  m = Geostatex.GeoFrame.variogram(sales, "log_price", n_lags: 12, maxlag: 0.5, model: model, use_nugget: true)
+  %{model: Atom.to_string(model), range: Enum.at(m.cof, 0), nugget: Enum.at(m.cof, 2), rmse: m.rmse}
+end
+|> DF.new()
+```
+
+The spherical and gaussian models fit the experimental points slightly better (RMSE 0.043 against
+0.048), with a larger nugget (0.10 and 0.14): all agree that prices are correlated up to about 40
+map units, and that a good part of the variation is house-to-house.
+
+## 3. Predicting prices: does location help, do the features help?
+
+Leave-one-out cross-validation predicts each sale from the other 210. The baseline is the mean of
+the others (no spatial information). Ordinary kriging uses the location; universal kriging adds
+house features as drift terms (the expected log price may depend on them): living area, age and
+bathrooms.
+
+```elixir
+values = S.to_list(data["log_price"])
+n = length(values)
+total = Enum.sum(values)
+
+baseline =
+  values
+  |> Enum.map(fn v -> (total - v) / (n - 1) - v end)
+  |> then(fn r -> :math.sqrt(Enum.sum(Enum.map(r, &(&1 * &1))) / n) end)
+
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+features = [column.("SQFT"), column.("AGE"), column.("NBATH")]
+opts = [variogram_model: :exponential, nlags: 10]
+
+cv = %{
+  "ordinary" => Geostatex.GeoFrame.cross_validate(sales, "log_price", :ordinary, opts),
+  "universal: regional trend" =>
+    Geostatex.GeoFrame.cross_validate(sales, "log_price", :universal, opts ++ [drift_terms: [:regional_linear]]),
+  "universal: house features" =>
+    Geostatex.GeoFrame.cross_validate(sales, "log_price", :universal,
+      opts ++ [drift_terms: [:specified], specified_drift: features]
+    )
+}
+
+DF.new(%{
+  model: ["mean of the others" | Map.keys(cv)],
+  rmse: [baseline | Enum.map(Map.values(cv), & &1.rmse)],
+  mae: [nil | Enum.map(Map.values(cv), & &1.mae)]
+})
+```
+
+Location helps: ordinary kriging cuts the error of the plain average from 0.565 to 0.452 (in log
+price, about 20% less). A regional linear trend adds little (0.443); the house features help more
+(0.436, and a mean absolute error of 0.270 against 0.293): kriging the part of the price the
+features do not explain works best.
+
+```elixir
+ok = Geostatex.GeoFrame.kriging(sales, "log_price", :ordinary, opts)
+stats = Kriging.statistics(ok)
+%{parameters: ok.variogram_model_parameters, q1: stats.q1, q2: stats.q2, cr: stats.cr}
+```
+
+PyKrige's automatic exponential variogram (fitted on its own lags) is much shorter: an effective
+range of about 11 map units and no nugget. Its `Q2` of 1.24 says the kriging errors are a little
+larger than the model expects.
+
+## 4. The price surface
+
+The automatic variogram above is fitted on PyKrige's own lags and reaches only 11 map units, a
+quarter of the range the variogram of section 2 found. On a map that matters: beyond its range a
+cell learns nothing from the sales and falls back to the mean. We krige the surface with the
+section 2 variogram instead, and check that it predicts left-out sales at least as well:
+
+```elixir
+fitted = %{range: Enum.at(v.cof, 0), psill: Enum.at(v.cof, 1), nugget: Enum.at(v.cof, 2)}
+map_opts = [variogram_model: :exponential, variogram_parameters: fitted]
+surface_model = Geostatex.GeoFrame.kriging(sales, "log_price", :ordinary, map_opts)
+map_cv = Geostatex.GeoFrame.cross_validate(sales, "log_price", :ordinary, map_opts)
+map_stats = Kriging.statistics(surface_model)
+
+%{
+  rmse_automatic_variogram: cv["ordinary"].rmse,
+  rmse_section_2_variogram: map_cv.rmse,
+  mae_section_2_variogram: map_cv.mae,
+  q1: map_stats.q1,
+  q2: map_stats.q2
+}
+```
+
+Ordinary kriging on a grid, within 15 map units of a sale (universal kriging with house features
+would need those features at every grid point, which a map does not have). The kriged log price,
+back-transformed with `exp`, is a typical (median) price rather than an average one. Its standard
+deviation is in log units, so we show it as a factor: a factor of 1.5 means the price is likely
+within 1.5 times above or below the value on the map.
+
+The section 2 variogram predicts left-out sales slightly better (RMSE 0.445 against 0.452, mean
+absolute error 0.291 against 0.293); its `Q2` of 1.30 says, again, that the errors are a little
+larger than the model expects.
+
+```elixir
+grid = Geostatex.GeoFrame.grid(surface_model, sales, nx: 60, ny: 60, max_distance: 15.0)
+grid = GDF.put(grid, "price_k", grid |> GDF.pull("prediction") |> S.exp())
+grid = GDF.put(grid, "factor", grid |> GDF.pull("variance") |> S.pow(0.5) |> S.exp())
+
+price = GDF.pull(grid, "price_k")
+factor = GDF.pull(grid, "factor")
+
+%{
+  cells: GDF.n_rows(grid),
+  min_price_k: S.min(price),
+  median_price_k: S.median(price),
+  max_price_k: S.max(price),
+  factor_near_sales: S.min(factor),
+  factor_far: S.max(factor)
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(on_map.(grid), color: {"price_k", :viridis}, radius: 4, tooltip: ["price_k", "factor"])
+```
+
+The surface goes from about 7 to 144 thousand dollars, with a median of 44 and four cells in five
+between 23 and 67. The highest prices lie to the north and west of the sales, the lowest in the
+south of the area. Kriged with the short automatic variogram instead, almost three cells in ten
+sat at the largest uncertainty and showed only the mean price; with the section 2 variogram, three
+in a hundred do.
+
+The uncertainty of the same map:
+
+```elixir
+GeoFrame.Kino.deck(on_map.(grid), color: {"factor", :viridis}, radius: 4, tooltip: ["factor", "price_k"])
+```
+
+The factor goes from 1.25 next to the sales to 1.81 at the edges, 1.43 for the typical cell: even
+the best-placed cell only knows the price within a quarter, because of the house-to-house nugget.
+A map of prices is a map of typical prices; a single house needs its features too.
+
+## What we learned
+
+* Log house prices are correlated up to about 40 map units, with a sizeable house-to-house
+  (nugget) part.
+* Kriging predicts left-out sales about 20% better than the average of the others; adding the
+  house features as drift terms (universal kriging) improves it further.
+* Kriging maps a price surface for places with no sale, with its uncertainty; the map must use
+  the variogram that describes the data (here the one of section 2), or most of it falls back to
+  the mean.
+
+Every Geostatex function used here is verified against scikit-gstat or PyKrige (see the parity
+guide).

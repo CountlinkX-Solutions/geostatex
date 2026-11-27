@@ -1,0 +1,289 @@
+# Caso de uso: metales pesados en la llanura de inundación del Mosa
+
+## Preparación
+
+> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
+> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame:
+> 
+> ```
+> GEOSTATEX_GEOFRAME_PATH=/ruta/a/geoframe livebook server notebooks/es/caso_mosa.livemd
+> ```
+> 
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+> 
+> ```
+> GEOSTATEX_GEOFRAME_PATH=/ruta/a/geoframe elixir scripts/run_livemd.exs notebooks/es/caso_mosa.livemd
+> ```
+> 
+> Si no se define `GEOSTATEX_GEOFRAME_PATH`, se usa `../geoframe` junto a este repositorio
+> (o `SPATEX_GEOFRAME_PATH`).
+> Versión en inglés: `notebooks/meuse_case.livemd`.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame antes de abrir este cuaderno (o pon geoframe junto a este repositorio)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "../..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## La pregunta
+
+El río Mosa inunda los campos de sus orillas, y su agua arrastra metales pesados de la minería y
+la industria río arriba. 155 muestras de suelo superficial tomadas en la llanura de inundación cerca
+de Stein, en el sur de los Países Bajos, miden cadmio, cobre, plomo y zinc. Son el ejemplo clásico
+de la geoestadística (distribuido con el paquete de R sp; ver `data/meuse/README.md` para su
+licencia GPL-3.0).
+
+Entre las muestras no se mide nada. La geoestadística pregunta:
+
+1. ¿Cómo crece la **diferencia** entre dos muestras con la distancia que las separa (el
+   **variograma**), y es igual en todas las **direcciones**?
+2. ¿Cuál es la mejor **estimación** del zinc en toda la llanura, y cuán **incierta** es
+   (**kriging**)?
+3. ¿Mejora la estimación saber la **distancia al río** (**kriging universal**, comprobado con
+   **validación cruzada**)?
+
+El zinc es muy asimétrico (unas pocas muestras muy contaminadas), así que, como es costumbre,
+trabajamos con su logaritmo.
+
+## 1. Las muestras
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+df =
+  [__DIR__, "..", "data", "meuse", "meuse.csv"]
+  |> Path.join()
+  |> DF.from_csv!()
+  |> DF.mutate(log_zinc: log(zinc), sqrt_dist: dist ** 0.5)
+
+coords = fn column -> df[column] |> S.cast({:f, 64}) end
+samples = GDF.new(df, GS.from_xy(coords.("x"), coords.("y"), crs: "EPSG:28992"))
+
+DF.summarise(df, n: count(zinc), min_ppm: min(zinc), mediana_ppm: median(zinc), max_ppm: max(zinc))
+```
+
+```elixir
+GeoFrame.Kino.deck(samples, color: {"zinc", :viridis}, radius: 5, tooltip: ["zinc", "dist"])
+```
+
+Las muestras más contaminadas están junto al río, en el lado oeste del mapa.
+
+## 2. El variograma
+
+El variograma experimental agrupa los pares de muestras por distancia y estima, para cada clase
+de distancia, la mitad de la diferencia cuadrática media de sus valores. Un modelo ajustado a él da
+la semivarianza a cualquier distancia: el **efecto pepita** (diferencias a muy corta distancia:
+error de medida y variación a microescala), la **meseta** (la varianza que se alcanza lejos) y el
+**alcance** (dónde se alcanza).
+
+```elixir
+v = Geostatex.GeoFrame.variogram(samples, "log_zinc", n_lags: 15, maxlag: 0.6, model: :spherical, use_nugget: true)
+
+%{alcance_m: Enum.at(v.cof, 0), meseta: Enum.at(v.cof, 1), pepita: Enum.at(v.cof, 2), rmse: v.rmse}
+```
+
+```elixir
+curve = for h <- 0..1600//20, do: %{lag_m: h, gamma: hd(Variogram.transform(v, [h]))}
+
+points =
+  for {b, e, n} <- Enum.zip([v.bins, v.experimental, v.bin_count]), e != :nan,
+      do: %{lag_m: b, gamma: e, pares: n}
+
+VegaLite.new(width: 520, height: 300, title: "Variograma de log(zinc)")
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(points)
+  |> VegaLite.mark(:point, size: 60)
+  |> VegaLite.encode_field(:x, "lag_m", type: :quantitative, title: "distancia (m)")
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivarianza")
+  |> VegaLite.encode_field(:tooltip, "pares", type: :quantitative),
+  VegaLite.new()
+  |> VegaLite.data_from_values(curve)
+  |> VegaLite.mark(:line)
+  |> VegaLite.encode_field(:x, "lag_m", type: :quantitative)
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative)
+])
+```
+
+Un modelo esférico con un alcance de unos 900 m, una meseta de 0,58 y sin efecto pepita: las
+muestras a más de 900 m son tan distintas como dos muestras cualesquiera, y las muy cercanas son
+casi iguales.
+
+¿Qué modelo se ajusta mejor? El mismo variograma experimental con otros modelos:
+
+```elixir
+for model <- [:spherical, :exponential, :gaussian, :matern] do
+  m = Geostatex.GeoFrame.variogram(samples, "log_zinc", n_lags: 15, maxlag: 0.6, model: model, use_nugget: true)
+  %{modelo: Atom.to_string(model), alcance_m: Enum.at(m.cof, 0), rmse: m.rmse}
+end
+|> DF.new()
+```
+
+El modelo esférico es el que mejor se ajusta (menor RMSE); los ajustes gaussiano y de Matérn
+necesitan un pequeño efecto pepita y el exponencial es el que peor se ajusta.
+
+### ¿Es la variación igual en todas las direcciones?
+
+Un variograma **direccional** solo usa los pares cuya separación apunta en un acimut (aquí a menos
+de 22,5 grados de él; los acimuts se miden desde el este en sentido horario, así que 90 es
+norte-sur y 45 es noroeste-sureste). Si el alcance cambia con la dirección, el campo es
+anisótropo.
+
+```elixir
+directional =
+  for azimuth <- [0, 45, 90, 135] do
+    d =
+      Geostatex.GeoFrame.variogram(samples, "log_zinc",
+        n_lags: 10,
+        maxlag: 0.6,
+        model: :spherical,
+        use_nugget: true,
+        direction: [azimuth: azimuth, tolerance: 45.0, model: :compass]
+      )
+
+    {azimuth, d}
+  end
+
+directional
+|> Enum.map(fn {az, d} -> %{acimut: az, alcance_m: Enum.at(d.cof, 0), meseta: Enum.at(d.cof, 1), pares: Enum.sum(d.bin_count)} end)
+|> DF.new()
+```
+
+```elixir
+dir_points =
+  for {az, d} <- directional, {b, e} <- Enum.zip(d.bins, d.experimental), e != :nan,
+      do: %{lag_m: b, gamma: e, acimut: Integer.to_string(az)}
+
+VegaLite.new(width: 520, height: 300, title: "Variogramas direccionales (acimut desde el este, horario)")
+|> VegaLite.data_from_values(dir_points)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag_m", type: :quantitative, title: "distancia (m)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivarianza")
+|> VegaLite.encode_field(:color, "acimut", type: :nominal)
+```
+
+El alcance es mayor de norte a sur (unos 1600 m) y menor de noroeste a sureste (unos 670 m): el
+zinc cambia despacio a lo largo del río, que aquí corre más o menos hacia el norte, y deprisa al
+alejarse de él, de las orillas contaminadas. El kriging de abajo sigue siendo isótropo por
+sencillez; `anisotropy_scaling` y `anisotropy_angle` lo tendrían en cuenta.
+
+## 3. Kriging
+
+El kriging ordinario estima el valor en un punto como una media ponderada de las muestras, con los
+pesos que minimizan el error esperado según el variograma, y da la varianza de ese error. Geostatex
+sigue aquí a PyKrige: su variograma automático se ajusta con las clases de distancia de PyKrige.
+
+```elixir
+ok = Geostatex.GeoFrame.kriging(samples, "log_zinc", :ordinary, variogram_model: :spherical, nlags: 12)
+stats = Kriging.statistics(ok)
+
+%{
+  meseta_parcial: Enum.at(ok.variogram_model_parameters, 0),
+  alcance_m: Enum.at(ok.variogram_model_parameters, 1),
+  pepita: Enum.at(ok.variogram_model_parameters, 2),
+  q1: stats.q1,
+  q2: stats.q2,
+  cr: stats.cr
+}
+```
+
+El variograma automático de PyKrige (con sus propias clases y otra ponderación) da un alcance
+menor, de unos 580 m, con una meseta parcial de 0,48 y un efecto pepita mínimo. Las estadísticas de
+PyKrige estiman cada muestra a partir de las anteriores: `Q1` (error estandarizado medio) debería
+estar cerca de 0 y `Q2` (error estandarizado cuadrático medio) cerca de 1 cuando el variograma
+describe bien los errores. Aquí `Q2` es 1,10 y `Q1` 0,34: los errores son del tamaño que espera el
+modelo, con algo de sesgo en las predicciones secuenciales.
+
+Predicciones en una malla de 40 m, conservando las celdas a menos de 250 m de una muestra:
+
+```elixir
+grid = Geostatex.GeoFrame.grid(ok, samples, cell: 40.0, max_distance: 250.0)
+
+grid =
+  grid
+  |> GDF.put("zinc_ppm", grid |> GDF.pull("prediction") |> S.exp())
+  |> GDF.put("desv_tipica", grid |> GDF.pull("variance") |> S.pow(0.5))
+
+GDF.n_rows(grid)
+```
+
+```elixir
+GeoFrame.Kino.deck(grid, color: {"zinc_ppm", :viridis}, radius: 3, tooltip: ["zinc_ppm", "desv_tipica"])
+```
+
+```elixir
+GeoFrame.Kino.deck(grid, color: {"desv_tipica", :viridis}, radius: 3, tooltip: ["desv_tipica"])
+```
+
+La estimación (devuelta a ppm con la exponencial, de unos 110 a 1840 ppm) es mayor junto al río.
+La incertidumbre (desviación típica de kriging de log(zinc), hasta 0,64) es mínima junto a las
+muestras y crece al alejarse de ellas: depende de dónde están las muestras, no de sus valores. (La
+exponencial del logaritmo estimado estima la mediana del zinc, no su media.)
+
+## 4. ¿Ayuda la distancia al río?
+
+La validación cruzada dejando uno fuera estima cada muestra a partir de las otras 154, con el
+variograma del modelo completo. El kriging universal añade como deriva la raíz cuadrada de la
+distancia (normalizada) al río: la media puede cambiar con ella.
+
+```elixir
+sqrt_dist = S.to_list(df["sqrt_dist"])
+opts = [variogram_model: :spherical, nlags: 12]
+
+cv_ok = Geostatex.GeoFrame.cross_validate(samples, "log_zinc", :ordinary, opts)
+
+cv_uk =
+  Geostatex.GeoFrame.cross_validate(samples, "log_zinc", :universal,
+    opts ++ [drift_terms: [:specified], specified_drift: [sqrt_dist]]
+  )
+
+DF.new(%{
+  modelo: ["ordinario", "universal (raíz de la distancia al río)"],
+  rmse: [cv_ok.rmse, cv_uk.rmse],
+  mae: [cv_ok.mae, cv_uk.mae]
+})
+```
+
+La deriva baja el RMSE de la validación cruzada de 0,417 a 0,400 y el MAE de 0,311 a 0,289: saber a
+qué distancia del río está un campo ayuda a estimar su zinc.
+
+```elixir
+residuals =
+  for {name, cv} <- [ordinario: cv_ok, universal: cv_uk], {r, i} <- Enum.with_index(cv.residuals),
+      do: %{modelo: Atom.to_string(name), muestra: i, residuo: r}
+
+VegaLite.new(width: 520, height: 220, title: "Residuos de log(zinc) dejando uno fuera")
+|> VegaLite.data_from_values(residuals)
+|> VegaLite.mark(:boxplot)
+|> VegaLite.encode_field(:x, "residuo", type: :quantitative)
+|> VegaLite.encode_field(:y, "modelo", type: :nominal)
+```
+
+## Qué hemos aprendido
+
+* El log(zinc) está correlacionado espacialmente hasta unos 900 m (variograma esférico, casi sin
+  efecto pepita), y más a lo largo del río que a través de él.
+* El kriging ordinario cartografía el zinc en la llanura con una incertidumbre que crece al
+  alejarse de las muestras; las estadísticas de PyKrige (`Q2` cerca de 1) dicen que el variograma
+  describe bien los errores.
+* La distancia al río es una deriva útil: el kriging universal predice mejor las muestras dejadas
+  fuera que el kriging ordinario.
+
+Todas las funciones de Geostatex usadas aquí están verificadas contra scikit-gstat o PyKrige (ver
+la guía de paridad).

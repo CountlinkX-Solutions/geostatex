@@ -1,0 +1,387 @@
+# Use case: do aerial images improve house prices? 2,000 sales in King County
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:pythonx, "~> 0.4.2"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "numpy==2.1.3",
+  "pillow==11.0.0",
+  "scikit-learn==1.5.2",
+  "xgboost==2.1.3",
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+```
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/king_county_images_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works (Elixir and Python cells):
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/king_county_images_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. The Python packages above are installed with uv the first time (PyTorch
+> CPU build), and the pretrained ResNet-18 weights are downloaded once (about 45 MB). The image
+> features take a few minutes on one CPU core.
+
+## The question
+
+The [Baltimore satellite case](baltimore_satellite_case.livemd) found that aerial-image features
+did not improve the price models, but with two handicaps: 211 sales, and images 45 years newer than
+the sales. Here both are removed: **2,000 sales** of 2014-2015 in King County, Washington (Seattle
+and its suburbs), with NAIP aerial images a few years newer, and 13 house features.
+
+The data are a seeded sample of the 21,613 sales of the King County house sales dataset (CC0,
+`data/king_county`), with a 120 x 120 m image around each house (`data/king_county_naip`, USDA
+NAIP, public domain). We ask:
+
+1. Do the images carry information about the price that the **house features** do not?
+2. Is that information more than **location**? (the images also tell where a house is)
+3. Does it survive **spatial validation**, repeated over several partitions?
+
+## 1. Sales, folds and images (Elixir)
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.Variogram
+
+df = [__DIR__, "data", "king_county", "sales_sample.csv"] |> Path.join() |> DF.from_csv!()
+df = DF.mutate(df, log_price: log(price), renovated: cast(yr_renovated > 0, :integer))
+
+feature_names =
+  ~w(bedrooms bathrooms sqft_living sqft_lot floors waterfront view condition grade yr_built renovated sqft_living15 sqft_lot15)
+
+column = fn name -> df[name] |> S.cast({:f, 64}) |> S.to_list() end
+y = column.("log_price")
+x = feature_names |> Enum.map(column) |> Enum.zip_with(& &1)
+location = Enum.zip_with(column.("lat"), column.("long"), &[&1, &2])
+n = length(y)
+
+sales = GDF.new(df, GS.from_xy(df["long"], df["lat"], crs: "EPSG:4326"))
+
+# Kilometres in UTM zone 10N, for the blocks and the variogram.
+{ux, uy} = sales |> GDF.to_crs("EPSG:32610") |> Geostatex.GeoFrame.points()
+km = Enum.zip(Enum.map(ux, &(&1 / 1000)), Enum.map(uy, &(&1 / 1000)))
+
+%{sales: n, features: length(feature_names), median_price: S.median(df["price"])}
+```
+
+```elixir
+GeoFrame.Kino.deck(sales, color: {"log_price", :viridis}, radius: 3, tooltip: ["price", "sqft_living", "grade"])
+```
+
+The median price is $450k. Prices are highest around Lake Washington (Seattle's north end,
+Bellevue, Mercer Island) and fall to the south. The standard deviation of the log price, which is
+the RMSE of always predicting the mean, is 0.52.
+
+Five random folds, and **spatial folds** made of 25 compact areas (k-means on the coordinates),
+five areas per fold: each fold leaves out whole neighbourhoods scattered over the county. The
+spatial partition is repeated with five seeds.
+
+```elixir
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+
+coords = Nx.tensor(Enum.map(km, &Tuple.to_list/1))
+
+spatial_folds =
+  for seed <- [3, 13, 23, 33, 43] do
+    coords
+    |> Scholar.Cluster.KMeans.fit(num_clusters: 25, key: Nx.Random.key(seed))
+    |> Scholar.Cluster.KMeans.predict(coords)
+    |> Nx.to_list()
+    |> Enum.map(&rem(&1, 5))
+  end
+
+spatial_fold = hd(spatial_folds)
+sales = GDF.put(sales, "fold", Enum.map(spatial_fold, &"fold #{&1}"))
+GeoFrame.Kino.deck(sales, color: {"fold", :categorical}, radius: 3, tooltip: ["fold"])
+```
+
+The images of the four cheapest and the four most expensive sales:
+
+```elixir
+chip_dir = Path.join([__DIR__, "data", "king_county_naip"])
+chip = fn row -> Path.join(chip_dir, "sale_#{String.pad_leading(Integer.to_string(row), 4, "0")}.jpg") end
+order = df["price"] |> S.to_list() |> Enum.with_index() |> Enum.sort()
+
+show = fn rows ->
+  Enum.map(rows, fn {p, i} ->
+    Kino.Layout.grid([Kino.Image.new(File.read!(chip.(i)), :jpeg), Kino.Markdown.new("**$#{round(p / 1000)}k**")], columns: 1)
+  end)
+end
+
+Kino.Layout.grid(show.(Enum.take(order, 4)) ++ show.(Enum.take(order, -4)), columns: 4)
+```
+
+## 2. Image features (Python)
+
+A ResNet-18 pretrained on ImageNet, without its classification layer, turns each image into 512
+numbers; twenty principal components summarise them. No price is used.
+
+```python
+import numpy as np
+import torch
+from PIL import Image
+from sklearn.decomposition import PCA
+from torchvision.models import ResNet18_Weights, resnet18
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+
+weights = ResNet18_Weights.DEFAULT
+network = resnet18(weights=weights)
+network.fc = torch.nn.Identity()
+network.eval()
+preprocess = weights.transforms()
+
+# Elixir strings arrive in Python as bytes.
+folder = chip_dir.decode() if isinstance(chip_dir, bytes) else chip_dir
+paths = [f"{folder}/sale_{row:04d}.jpg" for row in range(n)]
+
+with torch.no_grad():
+    parts = []
+    for i in range(0, n, 64):
+        batch = torch.stack([preprocess(Image.open(p).convert("RGB")) for p in paths[i:i + 64]])
+        parts.append(network(batch))
+    embeddings = torch.cat(parts).numpy()
+
+pca = PCA(n_components=20, random_state=0)
+image_features = pca.fit_transform(embeddings).tolist()
+explained = float(pca.explained_variance_ratio_.sum())
+```
+
+```elixir
+image_features = Pythonx.decode(image_features)
+%{variance_explained_by_20_components: Pythonx.decode(explained)}
+```
+
+The twenty components keep 61 % of the variation of the 512 numbers.
+
+## 3. Models (Python) and validation (Elixir)
+
+Ridge regression and XGBoost on five sets of inputs, each with random folds and with the first
+spatial partition.
+
+```python
+import xgboost as xgb
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+def make(kind):
+    if kind == "ridge":
+        return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    return xgb.XGBRegressor(n_estimators=400, max_depth=5, learning_rate=0.05, subsample=0.8,
+                            colsample_bytree=0.8, random_state=1, n_jobs=1)
+
+def out_of_fold(kind, rows, folds):
+    X, Y, folds = np.asarray(rows, dtype=float), np.asarray(y), np.asarray(folds)
+    pred = np.zeros(len(Y))
+    for f in range(5):
+        train, test = folds != f, folds == f
+        pred[test] = make(kind).fit(X[train], Y[train]).predict(X[test])
+    return pred.tolist()
+
+join = lambda *blocks: [sum(parts, []) for parts in zip(*blocks)]
+inputs = {
+    "house": x,
+    "image": image_features,
+    "house + location": join(x, location),
+    "house + image": join(x, image_features),
+    "house + location + image": join(x, location, image_features),
+}
+runs = {
+    f"{kind}|{name}|{scheme}": out_of_fold(kind, rows, folds)
+    for kind in ["ridge", "xgboost"]
+    for name, rows in inputs.items()
+    for scheme, folds in [("random", random_fold), ("spatial", spatial_fold)]
+}
+```
+
+```elixir
+rmse = fn preds -> :math.sqrt(Enum.sum(Enum.zip_with(preds, y, &((&1 - &2) ** 2))) / n) end
+runs = Pythonx.decode(runs)
+
+table =
+  runs
+  |> Enum.map(fn {key, preds} -> {String.split(key, "|"), rmse.(preds)} end)
+  |> Enum.group_by(fn {[kind, inputs, _], _} -> {kind, inputs} end)
+  |> Enum.map(fn {{kind, inputs}, rows} ->
+    by = Map.new(rows, fn {[_, _, scheme], v} -> {scheme, v} end)
+    %{model: kind, inputs: inputs, random_rmse: by["random"], spatial_rmse: by["spatial"]}
+  end)
+  |> Enum.sort_by(&{&1.model, &1.spatial_rmse})
+
+DF.new(table)
+```
+
+```elixir
+bars =
+  for r <- table, {scheme, v} <- [random: r.random_rmse, spatial: r.spatial_rmse],
+      do: %{label: "#{r.model}: #{r.inputs}", validation: Atom.to_string(scheme), rmse: v}
+
+VegaLite.new(width: 560, height: 320, title: "RMSE of log(price), 2,000 King County sales")
+|> VegaLite.data_from_values(bars)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "label", type: :nominal, sort: nil, axis: [label_angle: -35], title: nil)
+|> VegaLite.encode_field(:x_offset, "validation", type: :nominal)
+|> VegaLite.encode_field(:y, "rmse", type: :quantitative, title: "RMSE")
+|> VegaLite.encode_field(:color, "validation", type: :nominal)
+```
+
+* **The images carry some information on their own:** ridge on the image components alone reaches
+  0.50 with spatial blocks, against 0.52 for the mean. That is little, and far from the house
+  features (0.32).
+* **Added to the house features, they help:** 0.324 → 0.310 for ridge and 0.323 → 0.312 for
+  XGBoost with spatial blocks, and slightly more with random folds.
+* **Location helps much more:** XGBoost with the house features and the coordinates reaches 0.227
+  with spatial blocks. Each left-out area is surrounded by training areas, so the trees can
+  interpolate the price level between neighbourhoods.
+* **Once the coordinates are in, the images add nothing to XGBoost** (0.227 → 0.232). They still
+  help ridge (0.291 → 0.282), which can only use latitude and longitude as straight-line trends.
+
+## 4. Is the gain real? Five spatial partitions
+
+```python
+repeats = {
+    f"{kind}|{name}|{i}": out_of_fold(kind, inputs[name], folds)
+    for i, folds in enumerate(spatial_folds)
+    for kind in ["ridge", "xgboost"]
+    for name in ["house", "house + image", "house + location", "house + location + image"]
+}
+```
+
+```elixir
+repeated =
+  repeats
+  |> Pythonx.decode()
+  |> Enum.map(fn {key, preds} ->
+    [kind, inputs, i] = String.split(key, "|")
+    %{model: kind, inputs: inputs, partition: String.to_integer(i), rmse: rmse.(preds)}
+  end)
+
+summary =
+  repeated
+  |> Enum.group_by(&{&1.model, &1.inputs})
+  |> Enum.map(fn {{kind, inputs}, rows} ->
+    values = Enum.map(rows, & &1.rmse)
+    %{model: kind, inputs: inputs, mean_spatial_rmse: Enum.sum(values) / length(values), min: Enum.min(values), max: Enum.max(values)}
+  end)
+  |> Enum.sort_by(&{&1.model, &1.mean_spatial_rmse})
+
+DF.new(summary)
+```
+
+The averages over the five partitions repeat the first one: XGBoost with house features and
+location is best (0.215), and the images improve the models on the house features alone (ridge
+0.319 → 0.305, XGBoost 0.318 → 0.307).
+
+The gain from the images partition by partition (RMSE without images minus with images; positive
+means the images help):
+
+```elixir
+by_key = Map.new(repeated, &{{&1.model, &1.inputs, &1.partition}, &1.rmse})
+
+gains =
+  for kind <- ["ridge", "xgboost"], {base, with_image} <- [{"house", "house + image"}, {"house + location", "house + location + image"}],
+      p <- 0..4 do
+    %{model: kind, comparison: "#{base} → + image", partition: p, gain: by_key[{kind, base, p}] - by_key[{kind, with_image, p}]}
+  end
+
+DF.new(gains) |> DF.group_by(["model", "comparison"]) |> DF.summarise(mean_gain: mean(gain), min_gain: min(gain), max_gain: max(gain))
+```
+
+The gain is consistent, unlike in Baltimore. Over the house features alone, the images help in all
+five partitions: by 0.011 to 0.016 for ridge and 0.010 to 0.011 for XGBoost, about 3–4 % of the
+RMSE. On top of the coordinates, they help ridge a little (0.004 to 0.009) and make XGBoost
+slightly worse in all five partitions (by 0.003 to 0.007).
+
+## 5. What is left in space
+
+The variogram of the out-of-fold residuals of XGBoost with house features and images (first
+spatial partition), against that of the log prices:
+
+```elixir
+residuals = Enum.zip_with(y, runs["xgboost|house + image|spatial"], &(&1 - &2))
+v_price = Variogram.new(km, y, n_lags: 15, maxlag: 0.3, model: :exponential, use_nugget: true)
+v_resid = Variogram.new(km, residuals, n_lags: 15, maxlag: 0.3, model: :exponential, use_nugget: true)
+
+curves =
+  for {name, v} <- [{"log price", v_price}, {"residuals", v_resid}], {b, e} <- Enum.zip(v.bins, v.experimental), e != :nan,
+      do: %{series: name, lag_km: b, gamma: e}
+
+VegaLite.new(width: 520, height: 280, title: "Variograms: prices and residuals")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag_km", type: :quantitative, title: "distance (km)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivariance")
+|> VegaLite.encode_field(:color, "series", type: :nominal)
+```
+
+```elixir
+%{price_variogram: v_price.cof, residual_variogram: v_resid.cof}
+```
+
+The log prices are correlated up to about 20 km, with a sill of 0.24 and a nugget of 0.04. The
+residuals of the model with house features and images keep a weaker structure: their sill is 0.06
+and their nugget 0.04, and they still rise at 30 km. A large part of the price is a regional
+level, and the images do not capture it. The coordinates do, which is why they help XGBoost so
+much.
+
+## What we learned
+
+* With 2,000 recent sales, aerial images are a real but small feature. They lower the error of
+  models on the house features by 3–4 %, and the gain holds in every spatial partition. In
+  Baltimore, with 211 sales and images 45 years newer, they did not help at all.
+* Most of what the images add is **where** the house is: tree cover, density, the street pattern.
+  A model that already has the coordinates and can use them (XGBoost) gains nothing from them; a
+  linear model still gains a little.
+* Spatial validation is what tells the two apart. It is repeated over partitions, because one
+  partition can be lucky, and the variogram of the residuals shows what is left in space.
+* For a demo, the hybrid pattern holds: PyTorch and XGBoost run in Python cells, while the folds,
+  the summaries, the variograms and the maps stay in Elixir.

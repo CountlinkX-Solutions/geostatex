@@ -1,0 +1,343 @@
+# Use case: machine learning and geostatistics for Baltimore house prices
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/baltimore_ml_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/baltimore_ml_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. Spanish version: `notebooks/es/caso_ml_baltimore.livemd`.
+>
+> The models train on Nx's pure-Elixir backend, so the cross-validation of section 3 takes a few
+> minutes; adding `{:exla, ...}` and `Nx.global_default_backend(EXLA.Backend)` makes it faster.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:axon, "~> 0.9"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Logger.configure(level: :info)
+```
+
+## The question
+
+The [Baltimore case](baltimore_case.livemd) predicted house prices with kriging, using three house
+features as drift terms. Machine learning offers other tools for the same task: regularised linear
+models, nearest neighbours, neural networks. Which works better here, and how should they be
+**validated** when the data are spatial?
+
+Two things make spatial data special for machine learning:
+
+1. **Validation leaks through space.** With random folds, every test house has near-identical
+   neighbours in the training set, so a model that memorises *places* looks better than it is.
+   Validating by **spatial blocks** (whole areas left out) measures how a model does where it has
+   not seen the neighbourhood.
+2. **Residuals may stay spatially correlated.** A model of the house features leaves out what the
+   location adds; the variogram of its residuals says whether there is something left for kriging
+   (**regression kriging**: model + kriged residuals).
+
+We use the 211 sales of 1978 (Dubin 1992, distributed with PySAL), Scholar (ridge regression,
+nearest neighbours, k-means) and Axon (a small neural network).
+
+## 1. Features and target
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales = [__DIR__, "data", "baltimore", "baltim.shp"] |> Path.join() |> GeoFrame.read_file!()
+data = GDF.data(sales)
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+
+# The coordinates match the Maryland State Plane (NAD27, EPSG:26785) in thousands of US feet; maps
+# draw them that way, the analysis keeps the map units (1 unit = 1000 ft, about 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+features = ~w(SQFT LOTSZ AGE NROOM NBATH NSTOR PATIO FIREPL AC GAR BMENT DWELL CITCOU)
+y = column.("PRICE") |> Enum.map(&:math.log/1)
+xy = Enum.zip(column.("X"), column.("Y"))
+x = features |> Enum.map(column) |> Enum.zip_with(& &1)
+x_and_coords = Enum.zip_with(x, xy, fn row, {a, b} -> row ++ [a, b] end)
+coords = Enum.map(xy, &Tuple.to_list/1)
+n = length(y)
+
+%{sales: n, features: features}
+```
+
+The target is the logarithm of the price. The 13 features are the living area, lot size, age,
+rooms, bathrooms, stories, patio, fireplace, air conditioning, garage, basement, detached dwelling
+and county (against city).
+
+## 2. Two ways to validate
+
+Five folds both times. **Random** folds shuffle the sales; **spatial** folds are five areas found
+by k-means on the coordinates, each left out whole.
+
+```elixir
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+
+kmeans = Scholar.Cluster.KMeans.fit(Nx.tensor(coords), num_clusters: 5, key: Nx.Random.key(3))
+spatial_fold = kmeans |> Scholar.Cluster.KMeans.predict(Nx.tensor(coords)) |> Nx.to_list()
+
+sales = GDF.put(sales, "block", Enum.map(spatial_fold, &"block #{&1}"))
+GeoFrame.Kino.deck(on_map.(sales), color: {"block", :categorical}, radius: 6, tooltip: ["block", "PRICE"])
+```
+
+Five blocks over an area of about 130 by 75 map units are each a few tens of units across, of the
+order of the range of the price variogram (about 40): most test houses of a block have no close
+neighbours in training.
+
+## 3. Models
+
+Every model gets the training rows of a fold and predicts the test rows; features are standardised
+with the training rows' mean and deviation.
+
+* **mean**: the training mean, no information at all;
+* **ridge**: ridge regression (L2-regularised linear model) on the features, and on the features
+  plus the coordinates;
+* **KNN**: the mean of the 6 nearest training sales, location only;
+* **MLP**: a neural network (two hidden layers of 32 and 16 ReLU units, dropout, AdamW with weight
+  decay, 100 epochs, all seeded so that every run gives the same result), on the features and on
+  the features plus the coordinates.
+
+```elixir
+standardise = fn train, test ->
+  t = Nx.tensor(train)
+  mu = Nx.mean(t, axes: [0])
+  sd = t |> Nx.standard_deviation(axes: [0]) |> Nx.max(1.0e-9)
+  scale = &Nx.divide(Nx.subtract(&1, mu), sd)
+  {scale.(t), scale.(Nx.tensor(test))}
+end
+
+# Each model returns {test predictions, training predictions (or nil)}.
+mean_model = fn _xtr, ytr, xte ->
+  {List.duplicate(Enum.sum(ytr) / length(ytr), elem(Nx.shape(xte), 0)), nil}
+end
+
+ridge = fn xtr, ytr, xte ->
+  m = Scholar.Linear.RidgeRegression.fit(xtr, Nx.tensor(ytr), alpha: 1.0)
+  predict = &(m |> Scholar.Linear.RidgeRegression.predict(&1) |> Nx.to_flat_list())
+  {predict.(xte), predict.(xtr)}
+end
+
+knn = fn xtr, ytr, xte ->
+  m = Scholar.Neighbors.KNNRegressor.fit(xtr, Nx.reshape(Nx.tensor(ytr), {:auto, 1}), num_neighbors: 6)
+  {m |> Scholar.Neighbors.KNNRegressor.predict(xte) |> Nx.to_flat_list(), nil}
+end
+
+mlp = fn xtr, ytr, xte ->
+  model =
+    Axon.input("x", shape: {nil, elem(Nx.shape(xtr), 1)})
+    |> Axon.dense(32, activation: :relu)
+    |> Axon.dropout(rate: 0.1, seed: 1)
+    |> Axon.dense(16, activation: :relu)
+    |> Axon.dense(1)
+
+  batches = Enum.zip(Nx.to_batched(xtr, 32), Nx.to_batched(Nx.reshape(Nx.tensor(ytr), {:auto, 1}), 32))
+  optimizer = Polaris.Optimizers.adamw(learning_rate: 0.005, decay: 0.01)
+
+  trained =
+    model
+    |> Axon.Loop.trainer(:mean_squared_error, optimizer, log: 0, seed: 1)
+    |> Axon.Loop.run(batches, Axon.ModelState.empty(), epochs: 100)
+
+  params = case trained do
+    %{step_state: %{model_state: state}} -> state
+    state -> state
+  end
+
+  predict = &(model |> Axon.predict(params, &1) |> Nx.to_flat_list())
+  {predict.(xte), predict.(xtr)}
+end
+
+pick = fn list, ids -> Enum.map(ids, &Enum.at(list, &1)) end
+
+# Ordinary kriging of the training residuals, predicted at the test locations (PyKrige's automatic
+# exponential variogram, fitted on the training residuals of each fold).
+krige_residuals = fn train_xy, residuals, test_xy ->
+  k = Kriging.ordinary(train_xy, residuals, variogram_model: :exponential, nlags: 8)
+  {xs, ys} = Enum.unzip(test_xy)
+  {z, _} = Kriging.execute(k, :points, xs, ys)
+  z
+end
+
+cross_validate = fn folds, model, rows, krige? ->
+  all = Enum.to_list(0..(n - 1))
+
+  predictions =
+    for fold <- 0..4, reduce: %{} do
+      acc ->
+        train = Enum.filter(all, &(Enum.at(folds, &1) != fold))
+        test = Enum.filter(all, &(Enum.at(folds, &1) == fold))
+        {xtr, xte} = standardise.(pick.(rows, train), pick.(rows, test))
+        ytr = pick.(y, train)
+        {p, fitted} = model.(xtr, ytr, xte)
+
+        p =
+          if krige? do
+            residuals = Enum.zip_with(ytr, fitted, &(&1 - &2))
+            Enum.zip_with(p, krige_residuals.(pick.(xy, train), residuals, pick.(xy, test)), &(&1 + &2))
+          else
+            p
+          end
+
+        test |> Enum.zip(p) |> Enum.into(acc)
+    end
+
+  errors = Enum.map(0..(n - 1), fn i -> predictions[i] - Enum.at(y, i) end)
+  :math.sqrt(Enum.sum(Enum.map(errors, &(&1 * &1))) / n)
+end
+
+:ok
+```
+
+The cross-validation of every model, with both kinds of folds (the slow cell: the neural networks
+train ten times each):
+
+```elixir
+models = [
+  {"mean", mean_model, x, false},
+  {"ridge: features", ridge, x, false},
+  {"ridge: features + coordinates", ridge, x_and_coords, false},
+  {"KNN: location", knn, coords, false},
+  {"MLP: features", mlp, x, false},
+  {"MLP: features + coordinates", mlp, x_and_coords, false}
+]
+
+results =
+  for {name, model, rows, krige?} <- models do
+    %{
+      model: name,
+      random_rmse: cross_validate.(random_fold, model, rows, krige?),
+      spatial_rmse: cross_validate.(spatial_fold, model, rows, krige?)
+    }
+  end
+
+DF.new(results)
+```
+
+```elixir
+bars =
+  for r <- results, {scheme, v} <- [random: r.random_rmse, spatial: r.spatial_rmse],
+      do: %{model: r.model, validation: Atom.to_string(scheme), rmse: v}
+
+VegaLite.new(width: 520, height: 300, title: "Cross-validated RMSE of log(price)")
+|> VegaLite.data_from_values(bars)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: nil, axis: [label_angle: -30])
+|> VegaLite.encode_field(:x_offset, "validation", type: :nominal)
+|> VegaLite.encode_field(:y, "rmse", type: :quantitative, title: "RMSE")
+|> VegaLite.encode_field(:color, "validation", type: :nominal)
+```
+
+Three lessons in one table (RMSE of the log price):
+
+* **The house features carry the prediction.** Ridge regression on the 13 features (0.37) beats
+  every model of location alone, and the plain kriging of the Baltimore case (0.45 in
+  leave-one-out): what a house is matters more than where it is.
+* **Random folds flatter the models that use location.** KNN on the coordinates scores 0.45 with
+  random folds but 0.58 with spatial blocks, barely better than the mean (0.61); the neural network
+  with coordinates goes from 0.41 to 0.51. Within an area, a sale's neighbours are in the training
+  set and the model only has to look them up; in a new area there is nothing to look up. The
+  feature-only models score the same either way (ridge 0.37 and 0.37), which is what an honest
+  model should do.
+* **The neural network does not beat the linear model here.** With 211 sales and 13 features, the
+  MLP (0.41 with both kinds of folds) overfits where the regularised linear model does not; deep
+  learning needs far more data than this.
+
+## 4. Is there anything left for kriging?
+
+The variogram of the residuals of the ridge model on all sales, next to the variogram of the log
+prices themselves:
+
+```elixir
+{x_std, _} = standardise.(x, x)
+{_, fitted_all} = ridge.(x_std, y, x_std)
+residuals = Enum.zip_with(y, fitted_all, &(&1 - &2))
+
+v_price = Variogram.new(xy, y, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+v_resid = Variogram.new(xy, residuals, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+curves =
+  for {name, v} <- [{"log price", v_price}, {"ridge residuals", v_resid}],
+      {b, e} <- Enum.zip(v.bins, v.experimental), e != :nan,
+      do: %{series: name, lag: b, gamma: e}
+
+VegaLite.new(width: 520, height: 280, title: "Variograms: prices and model residuals")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distance (map units)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivariance")
+|> VegaLite.encode_field(:color, "series", type: :nominal)
+```
+
+```elixir
+%{
+  pykrige_variogram_of_residuals: Kriging.ordinary(xy, residuals, variogram_model: :exponential, nlags: 8).variogram_model_parameters
+}
+```
+
+The residual variogram is lower and much flatter than that of the prices: the features have taken
+up the spatial pattern. PyKrige's automatic fit makes it pure nugget (no partial sill), so kriging
+the residuals can only add their mean.
+
+Regression kriging: the ridge model and the neural network on the features, plus their kriged
+residuals:
+
+```elixir
+kriged =
+  for {name, model} <- [{"ridge: features + kriged residuals", ridge}, {"MLP: features + kriged residuals", mlp}] do
+    %{model: name, random_rmse: cross_validate.(random_fold, model, x, true), spatial_rmse: cross_validate.(spatial_fold, model, x, true)}
+  end
+
+DF.new(results ++ kriged)
+```
+
+The kriged residuals leave both models as they were (ridge 0.368 and 0.367, MLP 0.41): there is no
+spatial structure left to use once the features are in.
+
+## What we learned
+
+* With spatial data, **validate by spatial blocks**: random folds understated the error of a
+  location-only model by almost a quarter (0.45 against 0.58).
+* Model the **features** first; here a regularised linear model does it best, and a neural network
+  needs more data than 211 sales.
+* Check the **residual variogram**: if it is flat, as here, kriging has nothing to add; if not,
+  regression kriging (model + kriged residuals) recovers the spatial part the model missed.
+* Machine learning and geostatistics work together: the variogram sized the validation blocks,
+  diagnosed the residuals and supplied the kriging step.
+
+Every Geostatex function used here is verified against scikit-gstat or PyKrige (see the parity
+guide); Scholar and Axon are the Elixir ML libraries.

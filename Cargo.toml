@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["native/geostatex_core", "native/geostatex_native"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+license = "LGPL-3.0-only"

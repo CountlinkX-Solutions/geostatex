@@ -1,0 +1,93 @@
+name: Release NIFs
+
+# Builds the precompiled NIF artifacts for a release. Triggers:
+#   - a pushed `v*` tag: builds every artifact, checks the tag against mix.exs and attaches
+#     the artifacts to the GitHub release;
+#   - a pull request touching the build inputs (paths below): builds the same matrix as a dry
+#     run, so a broken matrix is found before a tag is pushed;
+#   - workflow_dispatch: the same dry run on demand.
+# Dry runs only upload workflow artifacts; they never touch a release. Publishing (tag,
+# GitHub release, Hex) is the owner's decision; see "Releasing" in the README.
+#
+# Artifact names follow rustler_precompiled:
+#   libgeostatex_native-v<version>-nif-<nif>-<target>.so.tar.gz
+# and must match the targets/nif_versions in lib/geostatex/native.ex
+# (test/geostatex/release_test.exs checks it).
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "native/**/Cargo.toml"
+      - "lib/geostatex/native.ex"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build_release:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nif: ["2.16", "2.17"]
+        job:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract the project version from mix.exs
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^ *@version "\(.*\)"/\1/p' mix.exs | head -n1)
+          echo "PROJECT_VERSION=$VERSION" >> "$GITHUB_ENV"
+          # On a tag push the tag and the package version must agree, or rustler_precompiled
+          # cannot find the files. Dry runs (pull request, manual) have no tag to compare.
+          if [[ "${GITHUB_REF}" == refs/tags/* && "v$VERSION" != "${GITHUB_REF_NAME}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match mix.exs version v$VERSION" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      # Cargo.toml at the repository root is a workspace; the cdylib is built from it, so the
+      # action runs at the root (project-dir "./") and finds target/<triple>/release there.
+      - name: Build the NIF
+        id: build-crate
+        uses: philss/rustler-precompiled-action@v1.1.5
+        with:
+          project-name: geostatex_native
+          project-version: ${{ env.PROJECT_VERSION }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          # Leave this empty for non-cross jobs. Action inputs are strings, so `|| false` would
+          # pass "false", which the action's `if:` treats as true and downloads `cross` anyway.
+          use-cross: ${{ matrix.job.use-cross }}
+          project-dir: "./"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-crate.outputs.file-name }}
+          path: ${{ steps.build-crate.outputs.file-path }}
+
+      - name: Attach the artifact to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build-crate.outputs.file-path }}

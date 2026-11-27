@@ -1,0 +1,221 @@
+# Use case: income of the US states in space and time, 1929-2009
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/us_income_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/us_income_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. Spanish version: `notebooks/es/caso_renta_eeuu.livemd`.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## The question
+
+In 1929 the poorest of the 48 contiguous states had a quarter of the per-capita income of the
+richest; by 2009 it had more than half. Regional economists call it **convergence**.
+Geostatistics adds the space-time view: states are similar to their **neighbours** (a spatial
+correlation) and to their own **past** (a temporal one), and both can change.
+
+The data are the per-capita personal income of the 48 contiguous states every year from 1929 to
+2009 (Bureau of Economic Analysis, distributed with PySAL). We work with income **relative** to
+the mean of the 48 states each year, which removes inflation and national growth. We ask:
+
+1. Does the spatial **variogram** of relative income shrink over the decades (convergence), and
+   does its range change?
+2. How does the correlation decay jointly in **space and time** (a space-time variogram)?
+3. How well can a state's income be **predicted** from its neighbours, measuring distances on the
+   sphere or on a map projection?
+
+## 1. The states and their incomes
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias Geostatex.{SpaceTimeVariogram, Variogram}
+
+dir = Path.join([__DIR__, "data", "us_income"])
+
+states =
+  dir
+  |> Path.join("us48.shp")
+  |> GeoFrame.read_file!()
+  |> GDF.set_crs("EPSG:4269")
+
+income = DF.from_csv!(Path.join(dir, "usjoin.csv"))
+years = Enum.map(1929..2009//10, &Integer.to_string/1)
+
+# Income relative to the mean of the 48 states, per decade, in the order of the state polygons.
+fips = states |> GDF.pull("STATE_FIPS") |> S.to_list() |> Enum.map(&String.to_integer/1)
+row_of = income["STATE_FIPS"] |> S.to_list() |> Enum.with_index() |> Map.new()
+
+relative =
+  for year <- years do
+    col = S.to_list(income[year])
+    mean = Enum.sum(col) / length(col)
+    Enum.map(fips, fn f -> Enum.at(col, row_of[f]) / mean end)
+  end
+
+states =
+  Enum.zip(years, relative)
+  |> Enum.reduce(states, fn {year, values}, acc -> GDF.put(acc, "rel_" <> year, values) end)
+
+%{states: GDF.n_rows(states), decades: years}
+```
+
+```elixir
+GeoFrame.Kino.deck(states, color: {"rel_1929", :viridis}, tooltip: ["STATE_NAME", "rel_1929", "rel_2009"])
+```
+
+```elixir
+GeoFrame.Kino.deck(states, color: {"rel_2009", :viridis}, tooltip: ["STATE_NAME", "rel_1929", "rel_2009"])
+```
+
+Relative income went from 0.44 to 1.87 times the mean in 1929, and from 0.79 to 1.42 in 2009.
+
+## 2. The spatial variogram, decade by decade
+
+The state centroids projected to the CONUS Albers equal-area projection (EPSG:5070), in km:
+
+```elixir
+{xs, ys} = states |> GDF.to_crs("EPSG:5070") |> Geostatex.GeoFrame.points()
+km = Enum.zip(Enum.map(xs, &(&1 / 1000)), Enum.map(ys, &(&1 / 1000)))
+
+by_decade =
+  for {year, values} <- Enum.zip(years, relative) do
+    v = Variogram.new(km, values, n_lags: 10, maxlag: 0.5, model: :spherical, use_nugget: true)
+    %{year: year, range_km: Enum.at(v.cof, 0), sill: Enum.at(v.cof, 1), nugget: Enum.at(v.cof, 2), variance: Enum.sum(Enum.map(values, &((&1 - 1) ** 2))) / 48}
+  end
+
+DF.new(by_decade)
+```
+
+```elixir
+VegaLite.new(width: 520, height: 260, title: "Spatial variogram sill and variance of relative income")
+|> VegaLite.data_from_values(for r <- by_decade, {k, v} <- [sill: r.sill, variance: r.variance], do: %{year: r.year, measure: Atom.to_string(k), value: v})
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "year", type: :ordinal)
+|> VegaLite.encode_field(:y, "value", type: :quantitative)
+|> VegaLite.encode_field(:color, "measure", type: :nominal)
+```
+
+The sill of the spatial variogram falls from 0.14 in 1929 to 0.006 in 2009, and the variance of
+relative income from 0.126 to 0.021: a strong convergence, mostly before 1980. Until 1979 almost all
+the variation is spatially structured (a nugget near 0, a range of about 1100 to 1400 km: regions
+of rich and poor states). From 1989 the nugget is larger than the sill: what differences remain
+are more state by state than regional, and the fitted range (about 2000 km) sits at the edge of
+the lags, poorly determined.
+
+## 3. The space-time variogram
+
+All the decades together: each pair of states at two decades is classed by its distance and its
+time lag (1 to 8 decades), giving a grid of semivariances. A product-sum model combines the
+spatial and the temporal marginal variograms.
+
+```elixir
+values_by_state = relative |> Enum.zip_with(& &1)
+st = SpaceTimeVariogram.new(km, values_by_state, x_lags: 8, maxlag: 0.6, model: :product_sum)
+
+%{
+  space_range_km: Enum.at(st.x_marginal.cof, 0),
+  time_range_decades: Enum.at(st.t_marginal.cof, 0),
+  sills: st.sills,
+  product_sum_k: st.cof
+}
+```
+
+```elixir
+cells =
+  for {row, xb} <- Enum.zip(st.experimental, st.xbins), {g, tb} <- Enum.zip(row, st.tbins), g != :nan,
+      do: %{distance_km: round(xb), decades: round(tb), gamma: g}
+
+VegaLite.new(width: 420, height: 300, title: "Space-time semivariance of relative income")
+|> VegaLite.data_from_values(cells)
+|> VegaLite.mark(:rect)
+|> VegaLite.encode_field(:x, "distance_km", type: :ordinal, title: "distance (km, upper edge)")
+|> VegaLite.encode_field(:y, "decades", type: :ordinal, title: "time lag (decades)")
+|> VegaLite.encode_field(:color, "gamma", type: :quantitative)
+```
+
+The spatial marginal reaches its sill by about 1040 km and the temporal one by about 1.2 decades:
+states resemble their neighbours up to roughly a thousand kilometres, and their own income of the
+previous decade, much less that of two decades before. The fitted product-sum coefficients
+(`k1 = 0`) reduce the model to a weighted sum of the two marginals.
+
+## 4. Predicting a state from its neighbours
+
+Leave-one-out kriging of 2009 relative income: on the sphere (great-circle distances on the
+longitude and latitude of the centroids) and on the Albers projection.
+
+```elixir
+centroids = states |> GDF.to_crs("EPSG:4326")
+v2009 = List.last(relative)
+opts = [variogram_model: :spherical, nlags: 8]
+
+{lon, lat} = Geostatex.GeoFrame.points(centroids)
+sphere = Geostatex.Kriging.cross_validate(:ordinary, Enum.zip(lon, lat), v2009, opts ++ [coordinates_type: :geographic])
+plane = Geostatex.Kriging.cross_validate(:ordinary, km, v2009, opts)
+mean_only = :math.sqrt(Enum.sum(Enum.map(v2009, fn v -> ((48 - v) / 47 - v) ** 2 end)) / 48)
+
+DF.new(%{
+  model: ["mean of the others", "kriging, great circle", "kriging, Albers km"],
+  rmse: [mean_only, sphere.rmse, plane.rmse]
+})
+```
+
+The states the neighbours predict worst:
+
+```elixir
+names = states |> GDF.pull("STATE_NAME") |> S.to_list()
+
+Enum.zip([names, v2009, sphere.predictions, sphere.residuals])
+|> Enum.sort_by(fn {_, _, _, r} -> -abs(r) end)
+|> Enum.take(6)
+|> Enum.map(fn {n, v, p, r} -> %{state: n, relative_2009: v, predicted: p, residual: r} end)
+|> DF.new()
+```
+
+Kriging predicts a state's 2009 relative income from the others with an RMSE of 0.118, against
+0.147 for the mean of the others: 20% better. Great-circle distances and the equal-area projection
+give the same result at this scale. The worst predictions are rich states among poorer neighbours
+(Connecticut, Massachusetts, Maryland, New Jersey, Wyoming) and Maine, poorer than its New England
+neighbours.
+
+## What we learned
+
+* Relative state incomes converged strongly between 1929 and 1979, and their regional pattern
+  (rich and poor regions about a thousand kilometres across) faded with it.
+* In space and time together, states resemble their neighbours up to about a thousand kilometres
+  and their own recent past; a sum of the two marginal variograms describes it.
+* Kriging from neighbouring states predicts a state's income better than the national mean; the
+  largest errors are states that differ from their region.
+
+Every Geostatex function used here is verified against scikit-gstat or PyKrige (see the parity
+guide).

@@ -1,0 +1,320 @@
+# Use case: aerial images as house features (deep learning)
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:pythonx, "~> 0.4.2"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "numpy==2.1.3",
+  "pillow==11.0.0",
+  "scikit-learn==1.5.2",
+  "xgboost==2.1.3",
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+```
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/baltimore_satellite_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works (Elixir and Python cells):
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/baltimore_satellite_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. The Python cells run through Pythonx; the first run installs PyTorch
+> (CPU build) and downloads the pretrained ResNet-18 weights (about 45 MB).
+> Spanish version: `notebooks/es/caso_satelite_baltimore.livemd`.
+
+## The idea
+
+A table of house features misses what a picture shows: trees, the size and shape of the
+buildings, the density of the street, parking, open space. Deep learning turns pictures into
+numbers. A convolutional network trained on millions of photos (ResNet-18 on ImageNet) has learnt
+general visual features; its last hidden layer, fed an aerial image of each sale, gives 512 numbers
+that describe the surroundings, without any training on our data. Those numbers become features
+for the price model.
+
+Fine-tuning the network on 211 images would overfit at once; using it as a fixed **feature
+extractor** is the sensible way to bring images into a small dataset.
+
+**A caveat for this demo.** The images are recent aerial photographs (USDA NAIP, public domain,
+`data/baltimore_naip`) while the sales are from 1978. Buildings and streets change slowly, so the
+images still describe the kind of place, but not the house as it was sold. With current sales and
+current images this caveat disappears.
+
+## 1. Sales, folds and images (Elixir)
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+
+sales = [__DIR__, "data", "baltimore", "baltim.shp"] |> Path.join() |> GeoFrame.read_file!()
+data = GDF.data(sales)
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+
+# The coordinates match the Maryland State Plane (NAD27, EPSG:26785) in thousands of US feet; maps
+# draw them that way, the analysis keeps the map units (1 unit = 1000 ft, about 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+feature_names = ~w(SQFT LOTSZ AGE NROOM NBATH NSTOR PATIO FIREPL AC GAR BMENT DWELL CITCOU)
+price = column.("PRICE")
+y = Enum.map(price, &:math.log/1)
+xy = Enum.zip(column.("X"), column.("Y"))
+x = feature_names |> Enum.map(column) |> Enum.zip_with(& &1)
+n = length(y)
+
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+coords = Nx.tensor(Enum.map(xy, &Tuple.to_list/1))
+kmeans = Scholar.Cluster.KMeans.fit(coords, num_clusters: 5, key: Nx.Random.key(3))
+spatial_fold = kmeans |> Scholar.Cluster.KMeans.predict(coords) |> Nx.to_list()
+
+chip_dir = Path.join([__DIR__, "data", "baltimore_naip"])
+chip = fn row -> Path.join(chip_dir, "sale_#{String.pad_leading(Integer.to_string(row), 3, "0")}.jpg") end
+
+%{sales: n, chips: Enum.count(0..(n - 1), &File.exists?(chip.(&1)))}
+```
+
+Each chip covers about 150 by 150 m around the sale. The four cheapest and the four most expensive
+sales:
+
+```elixir
+order = price |> Enum.with_index() |> Enum.sort()
+show = fn rows -> Enum.map(rows, fn {p, i} -> Kino.Layout.grid([Kino.Image.new(File.read!(chip.(i)), :jpeg), Kino.Markdown.new("**#{round(p)}k $**")], columns: 1) end) end
+
+Kino.Layout.grid(show.(Enum.take(order, 4)) ++ show.(Enum.take(order, -4)), columns: 4)
+```
+
+## 2. Image features from a pretrained network (Python)
+
+```python
+import numpy as np
+import torch
+from PIL import Image
+from sklearn.decomposition import PCA
+from torchvision.models import ResNet18_Weights, resnet18
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+
+weights = ResNet18_Weights.DEFAULT
+network = resnet18(weights=weights)
+network.fc = torch.nn.Identity()  # keep the 512 values of the last hidden layer
+network.eval()
+preprocess = weights.transforms()
+
+# Elixir strings arrive in Python as bytes.
+folder = chip_dir.decode() if isinstance(chip_dir, bytes) else chip_dir
+paths = [f"{folder}/sale_{row:03d}.jpg" for row in range(n)]
+with torch.no_grad():
+    batches = [torch.stack([preprocess(Image.open(p).convert("RGB")) for p in paths[i:i + 32]]) for i in range(0, n, 32)]
+    embeddings = torch.cat([network(b) for b in batches]).numpy()
+
+# Ten principal components of the 512 image features (unsupervised: the prices are not used).
+pca = PCA(n_components=10, random_state=0)
+image_features = pca.fit_transform(embeddings)
+explained = pca.explained_variance_ratio_.tolist()
+image_features = image_features.tolist()
+embedding_shape = list(embeddings.shape)
+```
+
+```elixir
+image_features = Pythonx.decode(image_features)
+explained = Pythonx.decode(explained)
+
+%{embedding_shape: Pythonx.decode(embedding_shape), variance_explained_by_10_components: Enum.sum(explained)}
+```
+
+Each image becomes 512 numbers; ten principal components keep 55% of their variation. The
+components describe the images, not the prices: nobody told the network what a house is worth.
+
+The first image component on the map:
+
+```elixir
+sales = GDF.put(sales, "image_pc1", Enum.map(image_features, &hd/1))
+GeoFrame.Kino.deck(on_map.(sales), color: {"image_pc1", :viridis}, radius: 6, tooltip: ["PRICE", "image_pc1"])
+```
+
+The first component is negatively correlated with lot size (-0.34) and with the log price
+(-0.24): it separates built-up, dense surroundings from open, green ones, a visual summary of the
+neighbourhood.
+
+## 3. Do the images help? (Python models, Elixir validation)
+
+Ridge regression and XGBoost on three sets of inputs: the house features, the image components
+alone, and both; each cross-validated with random folds and with spatial blocks.
+
+```python
+import xgboost as xgb
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+def make(kind):
+    if kind == "ridge":
+        return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    return xgb.XGBRegressor(n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8,
+                            colsample_bytree=0.8, random_state=1, n_jobs=1)
+
+def out_of_fold(kind, rows, folds):
+    X, Y, folds = np.asarray(rows, dtype=float), np.asarray(y), np.asarray(folds)
+    pred = np.zeros(len(Y))
+    for f in range(5):
+        train, test = folds != f, folds == f
+        pred[test] = make(kind).fit(X[train], Y[train]).predict(X[test])
+    return pred.tolist()
+
+inputs = {
+    "house features": x,
+    "image": image_features,
+    "house features + image": [a + b for a, b in zip(x, image_features)],
+}
+runs = {
+    f"{kind}|{name}|{scheme}": out_of_fold(kind, rows, folds)
+    for kind in ["ridge", "xgboost"]
+    for name, rows in inputs.items()
+    for scheme, folds in [("random", random_fold), ("spatial", spatial_fold)]
+}
+```
+
+```elixir
+rmse = fn preds -> :math.sqrt(Enum.sum(Enum.zip_with(preds, y, &((&1 - &2) ** 2))) / n) end
+
+results =
+  for {key, preds} <- Pythonx.decode(runs) do
+    [kind, inputs, scheme] = String.split(key, "|")
+    %{model: kind, inputs: inputs, validation: scheme, rmse: rmse.(preds)}
+  end
+
+table =
+  results
+  |> Enum.group_by(&{&1.model, &1.inputs})
+  |> Enum.map(fn {{m, i}, rows} ->
+    by = Map.new(rows, &{&1.validation, &1.rmse})
+    %{model: m, inputs: i, random_rmse: by["random"], spatial_rmse: by["spatial"]}
+  end)
+  |> Enum.sort_by(&{&1.model, &1.inputs})
+
+DF.new(table)
+```
+
+```elixir
+VegaLite.new(width: 520, height: 300, title: "RMSE of log(price): house features and images")
+|> VegaLite.data_from_values(Enum.map(results, &Map.put(&1, :label, "#{&1.model}: #{&1.inputs}")))
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "label", type: :nominal, sort: nil, axis: [label_angle: -30], title: nil)
+|> VegaLite.encode_field(:x_offset, "validation", type: :nominal)
+|> VegaLite.encode_field(:y, "rmse", type: :quantitative, title: "RMSE")
+|> VegaLite.encode_field(:color, "validation", type: :nominal)
+```
+
+* **The images alone carry information about the price:** 0.50 to 0.56, far from the house
+  features but well below the mean of the other sales (0.56 with random folds, 0.61 with spatial
+  blocks).
+* **Added to the house features, they do not clearly help.** Ridge gets slightly worse with them;
+  XGBoost gets worse with random folds (0.36 to 0.37) and better with spatial blocks (0.375 to
+  0.354), the best score of the table.
+
+## 4. Is the difference real?
+
+With 211 sales, a single set of five blocks can favour one model by luck. The same comparison
+over six other block partitions (k-means with other seeds):
+
+```elixir
+other_folds =
+  for seed <- [11, 21, 31, 41, 51, 61] do
+    coords
+    |> Scholar.Cluster.KMeans.fit(num_clusters: 5, key: Nx.Random.key(seed))
+    |> Scholar.Cluster.KMeans.predict(coords)
+    |> Nx.to_list()
+  end
+
+:ok
+```
+
+```python
+repeats = {
+    f"{kind}|{name}|{i}": out_of_fold(kind, inputs[name], folds)
+    for i, folds in enumerate(other_folds)
+    for kind in ["ridge", "xgboost"]
+    for name in ["house features", "house features + image"]
+}
+```
+
+```elixir
+repeats
+|> Pythonx.decode()
+|> Enum.map(fn {key, preds} ->
+  [kind, inputs, _] = String.split(key, "|")
+  {{kind, inputs}, rmse.(preds)}
+end)
+|> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+|> Enum.map(fn {{kind, inputs}, values} ->
+  %{model: kind, inputs: inputs, mean_spatial_rmse: Enum.sum(values) / length(values), min: Enum.min(values), max: Enum.max(values)}
+end)
+|> DF.new()
+```
+
+Over the six other partitions XGBoost with the house features averages about 0.347 and with the
+images 0.354; ridge 0.362 and 0.365. The images do not improve the models: the gain of section 3
+was the luck of one partition. Checking several partitions is cheap and keeps a small sample from
+telling a story it cannot support.
+
+## What we learned
+
+* A pretrained network turns aerial images into features in a few lines of Python, with no
+  training on our data; Elixir receives them as plain lists and handles the validation and maps.
+* The image features describe the neighbourhood (density, greenery) and predict prices by
+  themselves better than nothing, but not better than the house features, and adding them does not
+  improve the models here. That is no surprise: the images are 45 years younger than the sales and
+  the sample has 211 houses.
+* What makes the comparison trustworthy is the spatial validation and its repetition over several
+  partitions, both done in Elixir. Studies with current images and many thousands of sales
+  report gains from image features (for example Law, Paige and Russell, 2019, "Take a look
+  around"); this notebook is the pipeline to test it on such data.

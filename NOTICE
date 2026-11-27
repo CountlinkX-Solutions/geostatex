@@ -1,0 +1,83 @@
+geostatex
+Copyright the geostatex authors.
+
+Geostatex is free software: you can redistribute it and/or modify it under the terms of the GNU
+Lesser General Public License, version 3, as published by the Free Software Foundation. It is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the
+implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE (the GNU
+Lesser General Public License) and COPYING (the GNU General Public License it builds on).
+
+Origin of the code
+------------------
+Geostatex is a port. Its Elixir and Rust code was written for this project, in its own structure,
+by studying the source code, the documentation and the results of the libraries below, and it
+reproduces their numerical behaviour. It is therefore a derivative work of them, and it is
+distributed under the licence that all of their terms allow together.
+
+GSTools (https://github.com/GeoStat-Framework/GSTools), version 1.7.0, GNU Lesser General Public
+License version 3, by Sebastian Müller, Lennart Schüler and the GSTools contributors (see
+LICENSES/GSTools-AUTHORS.md). Followed for simple kriging, the unconditional and conditional
+Gaussian random fields (randomization method, seeding), and the covariance models Integral,
+Rational, Circular, SuperSpherical, JBessel and the truncated power laws, with their default
+bounds: native/geostatex_core/src/gstools.rs and simulation.rs, native/geostatex_native/src/
+simulation.rs, lib/geostatex/simulation.ex, and the parts of kriging.rs, fit.rs, models.rs,
+lib/geostatex/kriging.ex and lib/geostatex/variogram.ex that name it. This is the code that
+makes the library LGPL.
+
+scikit-gstat (https://github.com/mmaelicke/scikit-gstat), MIT License, Copyright (c) 2017 Mirko
+Mälicke (LICENSES/scikit-gstat-MIT.txt). Followed for experimental variograms, lag binning,
+estimators, theoretical models and their fitting, directional and space-time variograms.
+
+PyKrige (https://github.com/GeoStat-Framework/PyKrige), BSD 3-Clause License, Copyright (c)
+2015-2024 PyKrige Developers (LICENSES/PyKrige-BSD-3-Clause.txt). Followed for ordinary and
+universal kriging in 2D and 3D, drifts, anisotropy, geographic coordinates, moving windows,
+regression kriging and classification kriging.
+
+NumPy (https://numpy.org), BSD 3-Clause License, Copyright (c) 2005-2025 NumPy Developers
+(LICENSES/numpy-BSD-3-Clause.txt, and LICENSES/numpy-random-LICENSE.md for numpy.random).
+Followed for the MT19937 generator, SeedSequence and the legacy random draws, and for linspace,
+percentiles, the median, the standard deviation and histogram counts, which Geostatex reproduces
+bit for bit.
+
+SciPy (https://scipy.org), BSD 3-Clause License, Copyright (c) 2001-2002 Enthought, Inc.,
+2003 SciPy Developers (LICENSES/scipy-BSD-3-Clause.txt). Followed for pairwise distances, details
+of the trust-region least-squares fit, the modified Bessel function and the Helmert matrix.
+
+scikit-learn (https://scikit-learn.org), BSD 3-Clause License, Copyright (c) 2007-2026 The
+scikit-learn developers (LICENSES/scikit-learn-BSD-3-Clause.txt). Followed for isotonic
+regression and the regression interface of regression kriging.
+
+References that are not sources
+-------------------------------
+R gstat (https://github.com/r-spatial/gstat, GPL-2.0 or later) is the numerical reference of
+block kriging and of cokriging with a linear model of coregionalisation. Its behaviour was
+established by running it and reading its results and debug output; none of its source code was
+read or ported.
+
+GSLIB (Deutsch and Journel, 1998) is the reference of the order-relation corrections of indicator
+kriging, implemented from their published description.
+
+The special functions of gstools.rs (generalised exponential integral, regularised incomplete
+beta, Bessel function of real order) are implemented from the NIST Digital Library of
+Mathematical Functions (https://dlmf.nist.gov).
+
+Test fixtures
+-------------
+The files under test/reference/fixtures are numerical outputs of the libraries above, produced by
+the scripts under test/reference. They hold results, not code. The fixtures computed on the Meuse
+dataset repeat its coordinates and values (see Data); they are not part of the Geostatex package.
+
+Data
+----
+notebooks/data/meuse/meuse.csv is the Meuse dataset of the R package sp
+(https://cran.r-project.org/package=sp), as bundled with scikit-gstat, and is distributed under
+the GPL-3.0 license (see notebooks/data/meuse/README.md). It is used by the notebooks and the
+tests only and is not part of the Geostatex package.
+notebooks/data/baltimore and notebooks/data/us_income come from libpysal (BSD-3-Clause) and are
+not part of the Geostatex package either.
+notebooks/data/baltimore_naip holds USDA NAIP aerial image chips from the USGS National Map, in
+the public domain; not part of the Geostatex package.
+notebooks/data/king_county is a sample of the King County house sales published on OpenML
+(dataset 42092), under CC0 1.0; notebooks/data/king_county_naip holds USDA NAIP aerial image chips
+of those sales from the USGS National Map, in the public domain. Neither is part of the Geostatex
+package.

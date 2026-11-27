@@ -1,0 +1,286 @@
+# Caso de uso: precios de la vivienda en Baltimore
+
+## Preparación
+
+> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
+> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame junto a Geostatex:
+> 
+> ```
+> livebook server notebooks/es/caso_precios_baltimore.livemd
+> ```
+> 
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+> 
+> ```
+> elixir scripts/run_livemd.exs notebooks/es/caso_precios_baltimore.livemd
+> ```
+> 
+> GeoFrame se toma de `GEOSTATEX_GEOFRAME_PATH`, de `../geoframe` junto a este repositorio o de
+> `SPATEX_GEOFRAME_PATH`. Versión en inglés: `notebooks/baltimore_case.livemd`.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame (o pon geoframe junto a este repositorio)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "../..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+## La pregunta
+
+¿Cuánto vale una casa donde no se ha vendido ninguna? Los tasadores y los índices de precios
+interpolan entre ventas, y la geoestadística da un modelo a esa interpolación: los precios de casas
+cercanas están relacionados, y el variograma dice lo deprisa que esa relación se desvanece con la
+distancia. Parte del parecido viene de las propias casas (casas grandes junto a casas grandes),
+parte del lugar.
+
+Los datos son 211 ventas de viviendas de 1978 en la ciudad y el condado de Baltimore (Dubin 1992,
+distribuidos con PySAL), con el precio, las características de la casa y su ubicación en una malla
+plana local. Nos preguntamos:
+
+1. ¿Hasta dónde llega la **correlación espacial** de los precios?
+2. ¿**Predice** el kriging los precios en lugares sin venta mejor que una media simple, y mejora si
+   se conocen las **características de la casa** (kriging universal, juzgado por validación
+   cruzada)?
+3. ¿Cómo es la **superficie de precios**?
+
+## 1. Las ventas
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales =
+  [__DIR__, "..", "data", "baltimore", "baltim.shp"]
+  |> Path.join()
+  |> GeoFrame.read_file!()
+
+sales = GDF.put(sales, "log_price", sales |> GDF.pull("PRICE") |> S.log())
+data = GDF.data(sales)
+
+# Las coordenadas no tienen CRS. Coinciden con el State Plane de Maryland (NAD27, EPSG:26785) en
+# miles de pies de EE. UU., lo que sitúa las ventas en la ciudad y el condado de Baltimore; los
+# mapas las dibujan así, el análisis conserva las unidades de mapa (1 unidad = 1000 pies, unos
+# 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+%{
+  ventas: GDF.n_rows(sales),
+  precio_mediano_miles: S.median(data["PRICE"]),
+  rango_x: {S.min(data["X"]), S.max(data["X"])},
+  rango_y: {S.min(data["Y"]), S.max(data["Y"])}
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(on_map.(sales), color: {"PRICE", :viridis}, radius: 6, tooltip: ["PRICE", "SQFT", "AGE"])
+```
+
+Los precios (mediana de 40 mil dólares de 1978) son asimétricos, así que modelamos su logaritmo.
+Las coordenadas abarcan unas 130 por 75 unidades de mapa (unos 40 por 23 km).
+
+## 2. El variograma de los precios
+
+```elixir
+v = Geostatex.GeoFrame.variogram(sales, "log_price", n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+%{alcance: Enum.at(v.cof, 0), meseta: Enum.at(v.cof, 1), pepita: Enum.at(v.cof, 2), parte_pepita: Enum.at(v.cof, 2) / (Enum.at(v.cof, 1) + Enum.at(v.cof, 2))}
+```
+
+```elixir
+curve = for h <- Enum.map(0..60, &(&1 * Enum.max(v.bins) / 60)), do: %{lag: h, gamma: hd(Variogram.transform(v, [h]))}
+
+points =
+  for {b, e, n} <- Enum.zip([v.bins, v.experimental, v.bin_count]), e != :nan,
+      do: %{lag: b, gamma: e, pares: n}
+
+VegaLite.new(width: 520, height: 300, title: "Variograma de log(precio)")
+|> VegaLite.layers([
+  VegaLite.new()
+  |> VegaLite.data_from_values(points)
+  |> VegaLite.mark(:point, size: 60)
+  |> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distancia (unidades de mapa)")
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivarianza")
+  |> VegaLite.encode_field(:tooltip, "pares", type: :quantitative),
+  VegaLite.new()
+  |> VegaLite.data_from_values(curve)
+  |> VegaLite.mark(:line)
+  |> VegaLite.encode_field(:x, "lag", type: :quantitative)
+  |> VegaLite.encode_field(:y, "gamma", type: :quantitative)
+])
+```
+
+Un modelo exponencial alcanza su meseta (0,35) hacia las 40 unidades de mapa (su alcance efectivo),
+con un efecto pepita de 0,03. El **efecto pepita** es la variación entre casas contiguas: las
+diferencias entre las propias casas, que la ubicación no puede explicar.
+
+Modelos comparados sobre el mismo variograma experimental:
+
+```elixir
+for model <- [:spherical, :exponential, :gaussian] do
+  m = Geostatex.GeoFrame.variogram(sales, "log_price", n_lags: 12, maxlag: 0.5, model: model, use_nugget: true)
+  %{modelo: Atom.to_string(model), alcance: Enum.at(m.cof, 0), pepita: Enum.at(m.cof, 2), rmse: m.rmse}
+end
+|> DF.new()
+```
+
+Los modelos esférico y gaussiano se ajustan algo mejor a los puntos experimentales (RMSE 0,043
+frente a 0,048), con un efecto pepita mayor (0,10 y 0,14): todos coinciden en que los precios están
+correlacionados hasta unas 40 unidades de mapa, y en que buena parte de la variación es de casa a
+casa.
+
+## 3. Predecir precios: ¿ayuda la ubicación, ayudan las características?
+
+La validación cruzada dejando uno fuera predice cada venta a partir de las otras 210. La referencia
+es la media de las demás (sin información espacial). El kriging ordinario usa la ubicación; el
+universal añade características de la casa como derivas (el log del precio esperado puede depender
+de ellas): superficie habitable, antigüedad y baños.
+
+```elixir
+values = S.to_list(data["log_price"])
+n = length(values)
+total = Enum.sum(values)
+
+baseline =
+  values
+  |> Enum.map(fn v -> (total - v) / (n - 1) - v end)
+  |> then(fn r -> :math.sqrt(Enum.sum(Enum.map(r, &(&1 * &1))) / n) end)
+
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+features = [column.("SQFT"), column.("AGE"), column.("NBATH")]
+opts = [variogram_model: :exponential, nlags: 10]
+
+cv = %{
+  "ordinario" => Geostatex.GeoFrame.cross_validate(sales, "log_price", :ordinary, opts),
+  "universal: tendencia regional" =>
+    Geostatex.GeoFrame.cross_validate(sales, "log_price", :universal, opts ++ [drift_terms: [:regional_linear]]),
+  "universal: características" =>
+    Geostatex.GeoFrame.cross_validate(sales, "log_price", :universal,
+      opts ++ [drift_terms: [:specified], specified_drift: features]
+    )
+}
+
+DF.new(%{
+  modelo: ["media de las demás" | Map.keys(cv)],
+  rmse: [baseline | Enum.map(Map.values(cv), & &1.rmse)],
+  mae: [nil | Enum.map(Map.values(cv), & &1.mae)]
+})
+```
+
+La ubicación ayuda: el kriging ordinario reduce el error de la media simple de 0,565 a 0,452 (en
+log del precio, un 20 % menos). Una tendencia lineal regional añade poco (0,443); las
+características de la casa ayudan más (0,436, y un error absoluto medio de 0,270 frente a 0,293):
+lo mejor es aplicar el kriging a la parte del precio que las características no explican.
+
+```elixir
+ok = Geostatex.GeoFrame.kriging(sales, "log_price", :ordinary, opts)
+stats = Kriging.statistics(ok)
+%{parametros: ok.variogram_model_parameters, q1: stats.q1, q2: stats.q2, cr: stats.cr}
+```
+
+El variograma exponencial automático de PyKrige (ajustado con sus propias clases) es mucho más
+corto: un alcance efectivo de unas 11 unidades de mapa y sin efecto pepita. Su `Q2` de 1,24 dice
+que los errores del kriging son algo mayores de lo que espera el modelo.
+
+## 4. La superficie de precios
+
+El variograma automático de arriba se ajusta con las clases propias de PyKrige y llega solo a 11
+unidades de mapa, la cuarta parte del alcance que encontró el variograma de la sección 2. En un mapa
+eso importa: más allá de su alcance, una celda no aprende nada de las ventas y vuelve a la media.
+Por eso aplicamos el kriging a la superficie con el variograma de la sección 2, y comprobamos que
+predice las ventas dejadas fuera al menos igual de bien:
+
+```elixir
+fitted = %{range: Enum.at(v.cof, 0), psill: Enum.at(v.cof, 1), nugget: Enum.at(v.cof, 2)}
+map_opts = [variogram_model: :exponential, variogram_parameters: fitted]
+surface_model = Geostatex.GeoFrame.kriging(sales, "log_price", :ordinary, map_opts)
+map_cv = Geostatex.GeoFrame.cross_validate(sales, "log_price", :ordinary, map_opts)
+map_stats = Kriging.statistics(surface_model)
+
+%{
+  rmse_variograma_automatico: cv["ordinario"].rmse,
+  rmse_variograma_seccion_2: map_cv.rmse,
+  mae_variograma_seccion_2: map_cv.mae,
+  q1: map_stats.q1,
+  q2: map_stats.q2
+}
+```
+
+El variograma de la sección 2 predice las ventas dejadas fuera algo mejor (RMSE 0,445 frente a
+0,452, error absoluto medio 0,291 frente a 0,293); su `Q2` de 1,30 dice, otra vez, que los errores
+son algo mayores de lo que espera el modelo.
+
+Kriging ordinario en una malla, a menos de 15 unidades de mapa de una venta (el kriging universal
+con características necesitaría esas características en cada punto de la malla, que un mapa no
+tiene). El log del precio estimado, devuelto a dólares con `exp`, es un precio típico (la mediana),
+no un promedio. Su desviación típica está en unidades de log, así que la mostramos como un factor:
+un factor de 1,5 significa que el precio probablemente está entre 1,5 veces por debajo y 1,5 veces
+por encima del valor del mapa.
+
+```elixir
+grid = Geostatex.GeoFrame.grid(surface_model, sales, nx: 60, ny: 60, max_distance: 15.0)
+grid = GDF.put(grid, "precio_miles", grid |> GDF.pull("prediction") |> S.exp())
+grid = GDF.put(grid, "factor", grid |> GDF.pull("variance") |> S.pow(0.5) |> S.exp())
+
+price = GDF.pull(grid, "precio_miles")
+factor = GDF.pull(grid, "factor")
+
+%{
+  celdas: GDF.n_rows(grid),
+  precio_min_miles: S.min(price),
+  precio_mediano_miles: S.median(price),
+  precio_max_miles: S.max(price),
+  factor_junto_a_ventas: S.min(factor),
+  factor_lejos: S.max(factor)
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(on_map.(grid), color: {"precio_miles", :viridis}, radius: 4, tooltip: ["precio_miles", "factor"])
+```
+
+La superficie va de unos 7 a 144 mil dólares, con una mediana de 44 y cuatro de cada cinco celdas
+entre 23 y 67. Los precios más altos están al norte y al oeste de las ventas, los más bajos en el
+sur de la zona. Con el variograma automático corto, casi tres de cada diez celdas quedaban en la
+incertidumbre máxima y mostraban solo el precio medio; con el de la sección 2, tres de cada cien.
+
+La incertidumbre del mismo mapa:
+
+```elixir
+GeoFrame.Kino.deck(on_map.(grid), color: {"factor", :viridis}, radius: 4, tooltip: ["factor", "precio_miles"])
+```
+
+El factor va de 1,25 junto a las ventas a 1,81 en los bordes, 1,43 en la celda típica: incluso la
+celda mejor situada solo conoce el precio con un margen de una cuarta parte, por el efecto pepita de
+casa a casa. Un mapa de precios es un mapa de precios típicos; una casa concreta necesita además sus
+características.
+
+## Qué hemos aprendido
+
+* El log de los precios está correlacionado hasta unas 40 unidades de mapa, con una parte de casa a
+  casa (efecto pepita) considerable.
+* El kriging predice las ventas dejadas fuera un 20 % mejor que la media de las demás; añadir las
+  características de la casa como derivas (kriging universal) lo mejora aún más.
+* El kriging cartografía una superficie de precios para lugares sin venta, con su incertidumbre; el
+  mapa debe usar el variograma que describe los datos (aquí el de la sección 2), o gran parte de él
+  vuelve a la media.
+
+Todas las funciones de Geostatex usadas aquí están verificadas contra scikit-gstat o PyKrige (ver
+la guía de paridad).

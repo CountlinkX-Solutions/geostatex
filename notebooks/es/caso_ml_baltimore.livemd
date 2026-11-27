@@ -1,0 +1,347 @@
+# Caso de uso: aprendizaje automático y geoestadística para los precios de Baltimore
+
+## Preparación
+
+> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
+> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame junto a Geostatex:
+>
+> ```
+> livebook server notebooks/es/caso_ml_baltimore.livemd
+> ```
+>
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/es/caso_ml_baltimore.livemd
+> ```
+>
+> GeoFrame se toma de `GEOSTATEX_GEOFRAME_PATH`, de `../geoframe` junto a este repositorio o de
+> `SPATEX_GEOFRAME_PATH`. Versión en inglés: `notebooks/baltimore_ml_case.livemd`.
+>
+> Los modelos se entrenan con el backend en Elixir puro de Nx, así que la validación cruzada de la
+> sección 3 tarda unos minutos; añadir `{:exla, ...}` y `Nx.global_default_backend(EXLA.Backend)`
+> la acelera.
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame (o pon geoframe junto a este repositorio)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "../..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:axon, "~> 0.9"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+
+Logger.configure(level: :info)
+```
+
+## La pregunta
+
+El [caso de Baltimore](caso_precios_baltimore.livemd) predecía los precios con kriging, usando tres
+características de la casa como derivas. El aprendizaje automático ofrece otras herramientas para
+la misma tarea: modelos lineales regularizados, vecinos más cercanos, redes neuronales. ¿Cuál
+funciona mejor aquí, y cómo hay que **validarlas** cuando los datos son espaciales?
+
+Dos cosas hacen especiales los datos espaciales para el aprendizaje automático:
+
+1. **La validación se filtra por el espacio.** Con particiones aleatorias, cada casa de prueba tiene
+   vecinas casi idénticas en el entrenamiento, así que un modelo que memoriza *lugares* parece mejor
+   de lo que es. Validar por **bloques espaciales** (zonas enteras fuera) mide cómo le va a un
+   modelo donde no ha visto el vecindario.
+2. **Los residuos pueden seguir correlacionados en el espacio.** Un modelo de las características
+   de la casa deja fuera lo que aporta la ubicación; el variograma de sus residuos dice si queda
+   algo para el kriging (**kriging de regresión**: modelo + residuos krigeados).
+
+Usamos las 211 ventas de 1978 (Dubin 1992, distribuidas con PySAL), Scholar (regresión ridge,
+vecinos más cercanos, k-medias) y Axon (una red neuronal pequeña).
+
+## 1. Características y objetivo
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales = [__DIR__, "..", "data", "baltimore", "baltim.shp"] |> Path.join() |> GeoFrame.read_file!()
+data = GDF.data(sales)
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+
+# Las coordenadas coinciden con el State Plane de Maryland (NAD27, EPSG:26785) en miles de pies de
+# EE. UU.; los mapas las dibujan así, el análisis conserva las unidades de mapa (1 unidad = 1000
+# pies, unos 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+features = ~w(SQFT LOTSZ AGE NROOM NBATH NSTOR PATIO FIREPL AC GAR BMENT DWELL CITCOU)
+y = column.("PRICE") |> Enum.map(&:math.log/1)
+xy = Enum.zip(column.("X"), column.("Y"))
+x = features |> Enum.map(column) |> Enum.zip_with(& &1)
+x_and_coords = Enum.zip_with(x, xy, fn row, {a, b} -> row ++ [a, b] end)
+coords = Enum.map(xy, &Tuple.to_list/1)
+n = length(y)
+
+%{sales: n, features: features}
+```
+
+El objetivo es el logaritmo del precio. Las 13 características son la superficie habitable, el
+tamaño de la parcela, la antigüedad, las habitaciones, los baños, las plantas, el patio, la
+chimenea, el aire acondicionado, el garaje, el sótano, si es vivienda unifamiliar y si está en el
+condado (frente a la ciudad).
+
+## 2. Dos maneras de validar
+
+Cinco particiones en los dos casos. Las **aleatorias** barajan las ventas; las **espaciales** son
+cinco zonas que encuentra k-medias sobre las coordenadas, cada una fuera entera.
+
+```elixir
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+
+kmeans = Scholar.Cluster.KMeans.fit(Nx.tensor(coords), num_clusters: 5, key: Nx.Random.key(3))
+spatial_fold = kmeans |> Scholar.Cluster.KMeans.predict(Nx.tensor(coords)) |> Nx.to_list()
+
+sales = GDF.put(sales, "block", Enum.map(spatial_fold, &"bloque #{&1}"))
+GeoFrame.Kino.deck(on_map.(sales), color: {"block", :categorical}, radius: 6, tooltip: ["block", "PRICE"])
+```
+
+Cinco bloques sobre una zona de unas 130 por 75 unidades de mapa miden cada uno unas decenas de
+unidades, del orden del alcance del variograma de los precios (unas 40): la mayoría de las casas de
+prueba de un bloque no tienen vecinas cercanas en el entrenamiento.
+
+## 3. Modelos
+
+Cada modelo recibe las filas de entrenamiento de una partición y predice las de prueba; las
+características se estandarizan con la media y la desviación de las filas de entrenamiento.
+
+* **media**: la media del entrenamiento, ninguna información;
+* **ridge**: regresión ridge (modelo lineal con regularización L2) sobre las características, y
+  sobre las características más las coordenadas;
+* **KNN**: la media de las 6 ventas de entrenamiento más cercanas, solo la ubicación;
+* **MLP**: una red neuronal (dos capas ocultas de 32 y 16 unidades ReLU, dropout, AdamW con
+  decaimiento de pesos, 100 épocas, todo con semilla para que cada ejecución dé lo mismo), sobre
+  las características y sobre las características más las coordenadas.
+
+```elixir
+standardise = fn train, test ->
+  t = Nx.tensor(train)
+  mu = Nx.mean(t, axes: [0])
+  sd = t |> Nx.standard_deviation(axes: [0]) |> Nx.max(1.0e-9)
+  scale = &Nx.divide(Nx.subtract(&1, mu), sd)
+  {scale.(t), scale.(Nx.tensor(test))}
+end
+
+# Cada modelo devuelve {predicciones de prueba, predicciones de entrenamiento (o nil)}.
+mean_model = fn _xtr, ytr, xte ->
+  {List.duplicate(Enum.sum(ytr) / length(ytr), elem(Nx.shape(xte), 0)), nil}
+end
+
+ridge = fn xtr, ytr, xte ->
+  m = Scholar.Linear.RidgeRegression.fit(xtr, Nx.tensor(ytr), alpha: 1.0)
+  predict = &(m |> Scholar.Linear.RidgeRegression.predict(&1) |> Nx.to_flat_list())
+  {predict.(xte), predict.(xtr)}
+end
+
+knn = fn xtr, ytr, xte ->
+  m = Scholar.Neighbors.KNNRegressor.fit(xtr, Nx.reshape(Nx.tensor(ytr), {:auto, 1}), num_neighbors: 6)
+  {m |> Scholar.Neighbors.KNNRegressor.predict(xte) |> Nx.to_flat_list(), nil}
+end
+
+mlp = fn xtr, ytr, xte ->
+  model =
+    Axon.input("x", shape: {nil, elem(Nx.shape(xtr), 1)})
+    |> Axon.dense(32, activation: :relu)
+    |> Axon.dropout(rate: 0.1, seed: 1)
+    |> Axon.dense(16, activation: :relu)
+    |> Axon.dense(1)
+
+  batches = Enum.zip(Nx.to_batched(xtr, 32), Nx.to_batched(Nx.reshape(Nx.tensor(ytr), {:auto, 1}), 32))
+  optimizer = Polaris.Optimizers.adamw(learning_rate: 0.005, decay: 0.01)
+
+  trained =
+    model
+    |> Axon.Loop.trainer(:mean_squared_error, optimizer, log: 0, seed: 1)
+    |> Axon.Loop.run(batches, Axon.ModelState.empty(), epochs: 100)
+
+  params = case trained do
+    %{step_state: %{model_state: state}} -> state
+    state -> state
+  end
+
+  predict = &(model |> Axon.predict(params, &1) |> Nx.to_flat_list())
+  {predict.(xte), predict.(xtr)}
+end
+
+pick = fn list, ids -> Enum.map(ids, &Enum.at(list, &1)) end
+
+# Kriging ordinario de los residuos de entrenamiento, predicho en los puntos de prueba (variograma
+# exponencial automático de PyKrige, ajustado a los residuos de entrenamiento de cada partición).
+krige_residuals = fn train_xy, residuals, test_xy ->
+  k = Kriging.ordinary(train_xy, residuals, variogram_model: :exponential, nlags: 8)
+  {xs, ys} = Enum.unzip(test_xy)
+  {z, _} = Kriging.execute(k, :points, xs, ys)
+  z
+end
+
+cross_validate = fn folds, model, rows, krige? ->
+  all = Enum.to_list(0..(n - 1))
+
+  predictions =
+    for fold <- 0..4, reduce: %{} do
+      acc ->
+        train = Enum.filter(all, &(Enum.at(folds, &1) != fold))
+        test = Enum.filter(all, &(Enum.at(folds, &1) == fold))
+        {xtr, xte} = standardise.(pick.(rows, train), pick.(rows, test))
+        ytr = pick.(y, train)
+        {p, fitted} = model.(xtr, ytr, xte)
+
+        p =
+          if krige? do
+            residuals = Enum.zip_with(ytr, fitted, &(&1 - &2))
+            Enum.zip_with(p, krige_residuals.(pick.(xy, train), residuals, pick.(xy, test)), &(&1 + &2))
+          else
+            p
+          end
+
+        test |> Enum.zip(p) |> Enum.into(acc)
+    end
+
+  errors = Enum.map(0..(n - 1), fn i -> predictions[i] - Enum.at(y, i) end)
+  :math.sqrt(Enum.sum(Enum.map(errors, &(&1 * &1))) / n)
+end
+
+:ok
+```
+
+La validación cruzada de cada modelo, con los dos tipos de particiones (la celda lenta: las redes
+neuronales se entrenan diez veces cada una):
+
+```elixir
+models = [
+  {"mean", mean_model, x, false},
+  {"ridge: features", ridge, x, false},
+  {"ridge: features + coordinates", ridge, x_and_coords, false},
+  {"KNN: location", knn, coords, false},
+  {"MLP: features", mlp, x, false},
+  {"MLP: features + coordinates", mlp, x_and_coords, false}
+]
+
+results =
+  for {name, model, rows, krige?} <- models do
+    %{
+      model: name,
+      random_rmse: cross_validate.(random_fold, model, rows, krige?),
+      spatial_rmse: cross_validate.(spatial_fold, model, rows, krige?)
+    }
+  end
+
+DF.new(results)
+```
+
+```elixir
+bars =
+  for r <- results, {scheme, v} <- [random: r.random_rmse, spatial: r.spatial_rmse],
+      do: %{model: r.model, validation: Atom.to_string(scheme), rmse: v}
+
+VegaLite.new(width: 520, height: 300, title: "RMSE de log(precio) en validación cruzada")
+|> VegaLite.data_from_values(bars)
+|> VegaLite.mark(:bar)
+|> VegaLite.encode_field(:x, "model", type: :nominal, sort: nil, axis: [label_angle: -30])
+|> VegaLite.encode_field(:x_offset, "validation", type: :nominal)
+|> VegaLite.encode_field(:y, "rmse", type: :quantitative, title: "RMSE")
+|> VegaLite.encode_field(:color, "validation", type: :nominal)
+```
+
+Tres lecciones en una tabla (RMSE del log del precio):
+
+* **Las características de la casa sostienen la predicción.** La regresión ridge sobre las 13
+  características (0,37) gana a todos los modelos de solo ubicación y al kriging simple del caso de
+  Baltimore (0,45 dejando uno fuera): lo que es una casa importa más que dónde está.
+* **Las particiones aleatorias favorecen a los modelos que usan la ubicación.** KNN sobre las
+  coordenadas da 0,45 con particiones aleatorias pero 0,58 con bloques espaciales, apenas mejor que
+  la media (0,61); la red neuronal con coordenadas pasa de 0,41 a 0,51. Dentro de una zona, las
+  vecinas de una venta están en el entrenamiento y al modelo le basta con buscarlas; en una zona
+  nueva no hay nada que buscar. Los modelos de solo características dan lo mismo de las dos maneras
+  (ridge 0,37 y 0,37), que es lo que debe hacer un modelo honesto.
+* **La red neuronal no gana aquí al modelo lineal.** Con 211 ventas y 13 características, el MLP
+  (0,41 con los dos tipos de particiones) sobreajusta donde el modelo lineal regularizado no; el
+  aprendizaje profundo necesita muchos más datos que estos.
+
+## 4. ¿Queda algo para el kriging?
+
+El variograma de los residuos del modelo ridge sobre todas las ventas, junto al variograma del log
+de los precios:
+
+```elixir
+{x_std, _} = standardise.(x, x)
+{_, fitted_all} = ridge.(x_std, y, x_std)
+residuals = Enum.zip_with(y, fitted_all, &(&1 - &2))
+
+v_price = Variogram.new(xy, y, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+v_resid = Variogram.new(xy, residuals, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+curves =
+  for {name, v} <- [{"log price", v_price}, {"ridge residuals", v_resid}],
+      {b, e} <- Enum.zip(v.bins, v.experimental), e != :nan,
+      do: %{series: name, lag: b, gamma: e}
+
+VegaLite.new(width: 520, height: 280, title: "Variogramas: precios y residuos del modelo")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distancia (unidades de mapa)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivarianza")
+|> VegaLite.encode_field(:color, "series", type: :nominal)
+```
+
+```elixir
+%{
+  pykrige_variogram_of_residuals: Kriging.ordinary(xy, residuals, variogram_model: :exponential, nlags: 8).variogram_model_parameters
+}
+```
+
+El variograma de los residuos es más bajo y mucho más plano que el de los precios: las
+características han absorbido el patrón espacial. El ajuste automático de PyKrige lo deja en puro
+efecto pepita (sin meseta parcial), así que krigear los residuos solo puede añadir su media.
+
+Kriging de regresión: el modelo ridge y la red neuronal sobre las características, más sus
+residuos krigeados:
+
+```elixir
+kriged =
+  for {name, model} <- [{"ridge: features + kriged residuals", ridge}, {"MLP: features + kriged residuals", mlp}] do
+    %{model: name, random_rmse: cross_validate.(random_fold, model, x, true), spatial_rmse: cross_validate.(spatial_fold, model, x, true)}
+  end
+
+DF.new(results ++ kriged)
+```
+
+Los residuos krigeados dejan los dos modelos como estaban (ridge 0,368 y 0,367, MLP 0,41): no queda
+estructura espacial que aprovechar una vez dentro las características.
+
+## Qué hemos aprendido
+
+* Con datos espaciales, **valida por bloques espaciales**: las particiones aleatorias subestimaron
+  casi en una cuarta parte el error de un modelo de solo ubicación (0,45 frente a 0,58).
+* Modela primero las **características**; aquí lo hace mejor un modelo lineal regularizado, y una
+  red neuronal necesita más datos que 211 ventas.
+* Mira el **variograma de los residuos**: si es plano, como aquí, el kriging no tiene nada que
+  añadir; si no, el kriging de regresión (modelo + residuos krigeados) recupera la parte espacial
+  que el modelo no captó.
+* El aprendizaje automático y la geoestadística trabajan juntos: el variograma dimensionó los
+  bloques de validación, diagnosticó los residuos y aportó el paso de kriging.
+
+Todas las funciones de Geostatex usadas aquí están verificadas contra scikit-gstat o PyKrige (ver
+la guía de paridad); Scholar y Axon son las bibliotecas de aprendizaje automático de Elixir.

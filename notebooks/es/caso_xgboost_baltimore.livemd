@@ -1,0 +1,260 @@
+# Caso de uso: XGBoost en Python, geoestadística en Elixir
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame (o pon geoframe junto a este repositorio)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "../..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:pythonx, "~> 0.4.2"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "numpy==2.1.3",
+  "scikit-learn==1.5.2",
+  "xgboost==2.1.3",
+]
+```
+
+## Preparación
+
+> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
+> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame junto a Geostatex:
+>
+> ```
+> livebook server notebooks/es/caso_xgboost_baltimore.livemd
+> ```
+>
+> o sin interfaz, para comprobar que todas las celdas funcionan (Elixir y Python):
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/es/caso_xgboost_baltimore.livemd
+> ```
+>
+> GeoFrame se toma de `GEOSTATEX_GEOFRAME_PATH`, de `../geoframe` junto a este repositorio o de
+> `SPATEX_GEOFRAME_PATH`. Las celdas Python se ejecutan con
+> [Pythonx](https://github.com/livebook-dev/pythonx), que instala los paquetes de Python de arriba con
+> uv la primera vez. Versión en inglés: `notebooks/baltimore_xgboost_case.livemd`.
+
+## La idea
+
+Cada lenguaje hace lo que mejor hace su ecosistema:
+
+* **Python** entrena el modelo: XGBoost (árboles potenciados por gradiente), el ganador habitual en
+  datos tabulares.
+* **Elixir** hace la parte espacial: las particiones de validación (aleatorias y por bloques
+  espaciales), el variograma de los residuos y su kriging (Geostatex), y los mapas (GeoFrame).
+
+Livebook pasa los valores entre los dos: una variable de Elixir usada en una celda Python se
+convierte en una global de Python, y lo que asigna una celda Python vuelve a Elixir como
+`Pythonx.Object`, que `Pythonx.decode/1` convierte en datos de Elixir.
+
+Los datos son las 211 ventas de viviendas de Baltimore de 1978 del
+[caso de aprendizaje automático](caso_ml_baltimore.livemd), donde la regresión ridge sobre las
+características de la casa fue la mejor (RMSE del log del precio 0,37 con los dos tipos de
+particiones).
+
+## 1. Datos y particiones (Elixir)
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales = [__DIR__, "..", "data", "baltimore", "baltim.shp"] |> Path.join() |> GeoFrame.read_file!()
+data = GDF.data(sales)
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+
+# Las coordenadas coinciden con el State Plane de Maryland (NAD27, EPSG:26785) en miles de pies de
+# EE. UU.; los mapas las dibujan así, el análisis conserva las unidades de mapa (1 unidad = 1000
+# pies, unos 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+feature_names = ~w(SQFT LOTSZ AGE NROOM NBATH NSTOR PATIO FIREPL AC GAR BMENT DWELL CITCOU)
+y = column.("PRICE") |> Enum.map(&:math.log/1)
+xy = Enum.zip(column.("X"), column.("Y"))
+x = feature_names |> Enum.map(column) |> Enum.zip_with(& &1)
+x_and_coords = Enum.zip_with(x, xy, fn row, {a, b} -> row ++ [a, b] end)
+n = length(y)
+
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+
+coords = Nx.tensor(Enum.map(xy, &Tuple.to_list/1))
+kmeans = Scholar.Cluster.KMeans.fit(coords, num_clusters: 5, key: Nx.Random.key(3))
+spatial_fold = kmeans |> Scholar.Cluster.KMeans.predict(coords) |> Nx.to_list()
+
+%{sales: n, features: length(feature_names)}
+```
+
+Las particiones son las del caso de aprendizaje automático: cinco aleatorias y cinco bloques
+espaciales que encuentra k-medias sobre las coordenadas.
+
+## 2. XGBoost fuera de muestra (Python)
+
+En cada partición, XGBoost se entrena con las otras cuatro y predice las ventas que quedan fuera.
+Para el paso de kriging necesita además residuos en las ventas de entrenamiento que no estén
+sobreajustados, así que dentro de cada conjunto de entrenamiento una segunda validación cruzada de
+5 particiones da predicciones fuera de muestra del entrenamiento.
+
+```python
+import numpy as np
+import xgboost as xgb
+
+def boosted():
+    return xgb.XGBRegressor(
+        n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8,
+        colsample_bytree=0.8, random_state=1, n_jobs=1,
+    )
+
+def out_of_fold(rows, target, folds):
+    X, Y, folds = np.asarray(rows, dtype=float), np.asarray(target, dtype=float), np.asarray(folds)
+    test_pred = np.zeros(len(Y))
+    train_oof = []
+    for f in range(5):
+        train, test = folds != f, folds == f
+        test_pred[test] = boosted().fit(X[train], Y[train]).predict(X[test])
+        # Predicciones internas fuera de muestra de las ventas de entrenamiento de esta partición.
+        idx = np.flatnonzero(train)
+        inner = np.arange(len(idx)) % 5
+        oof = np.zeros(len(idx))
+        for g in range(5):
+            fit, held = inner != g, inner == g
+            oof[held] = boosted().fit(X[idx[fit]], Y[idx[fit]]).predict(X[idx[held]])
+        train_oof.append(oof.tolist())
+    return test_pred.tolist(), train_oof
+
+runs = {}
+for name, rows in [("features", x), ("features + coordinates", x_and_coords)]:
+    for scheme, folds in [("random", random_fold), ("spatial", spatial_fold)]:
+        runs[f"{name}|{scheme}"] = out_of_fold(rows, y, folds)
+
+importance = dict(zip(feature_names, boosted().fit(np.asarray(x, dtype=float), np.asarray(y)).feature_importances_.tolist()))
+```
+
+De vuelta en Elixir, las predicciones se convierten en datos normales:
+
+```elixir
+runs = Pythonx.decode(runs)
+importance = Pythonx.decode(importance)
+
+importance
+|> Enum.sort_by(fn {_, v} -> -v end)
+|> Enum.map(fn {feature, gain} -> %{feature: feature, importance: gain} end)
+|> DF.new()
+```
+
+XGBoost se apoya sobre todo en si la casa es unifamiliar, si está en el condado, el tamaño de la
+parcela, la chimenea y el aire acondicionado.
+
+## 3. Validación y kriging de regresión (Elixir)
+
+El RMSE de cada ejecución, y el de las mismas predicciones más los residuos krigeados: kriging
+ordinario (variograma exponencial automático de PyKrige) de los residuos fuera de muestra del
+entrenamiento, predicho en las ventas que quedan fuera.
+
+```elixir
+rmse = fn preds -> :math.sqrt(Enum.sum(Enum.zip_with(preds, y, &((&1 - &2) ** 2))) / n) end
+pick = fn list, ids -> Enum.map(ids, &Enum.at(list, &1)) end
+
+kriged = fn {test_pred, train_oof}, folds ->
+  all = Enum.to_list(0..(n - 1))
+
+  corrections =
+    for f <- 0..4, reduce: %{} do
+      acc ->
+        train = Enum.filter(all, &(Enum.at(folds, &1) != f))
+        test = Enum.filter(all, &(Enum.at(folds, &1) == f))
+        residuals = Enum.zip_with(pick.(y, train), Enum.at(train_oof, f), &(&1 - &2))
+        k = Kriging.ordinary(pick.(xy, train), residuals, variogram_model: :exponential, nlags: 8)
+        {xs, ys} = test |> then(&pick.(xy, &1)) |> Enum.unzip()
+        {z, _} = Kriging.execute(k, :points, xs, ys)
+        test |> Enum.zip(z) |> Enum.into(acc)
+    end
+
+  Enum.with_index(test_pred, fn p, i -> p + corrections[i] end)
+end
+
+folds_of = %{"random" => random_fold, "spatial" => spatial_fold}
+
+results =
+  for {key, run} <- runs do
+    [name, scheme] = String.split(key, "|")
+    {test_pred, _} = run
+    %{model: "XGBoost: " <> name, validation: scheme, rmse: rmse.(test_pred), rmse_with_kriged_residuals: rmse.(kriged.(run, folds_of[scheme]))}
+  end
+
+DF.new(results) |> DF.sort_by(asc: model, asc: validation)
+```
+
+* **Con las características, XGBoost es más o menos igual de bueno que la regresión ridge:** 0,36
+  con particiones aleatorias y 0,37 con bloques espaciales (ridge: 0,37 y 0,37). Con 211 ventas, la
+  flexibilidad de los árboles aporta poco frente a un modelo lineal regularizado.
+* **Las coordenadas solo ayudan donde se filtran.** Con ellas XGBoost tiene la mejor puntuación de
+  todas con particiones aleatorias (0,356) y una peor con bloques espaciales (0,386): los árboles
+  aprenden lugares, y una zona nueva no los tiene.
+* **Los residuos krigeados no cambian nada** (tercer decimal): como con ridge, las características
+  no dejan estructura espacial que el kriging pueda aprovechar.
+
+## 4. Los residuos en el mapa
+
+Los residuos fuera de muestra de XGBoost sobre las características (bloques espaciales) y su
+variograma:
+
+```elixir
+{spatial_pred, _} = runs["features|spatial"]
+residuals = Enum.zip_with(y, spatial_pred, &(&1 - &2))
+v = Variogram.new(xy, residuals, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+sales = GDF.put(sales, "residual", residuals)
+GeoFrame.Kino.deck(on_map.(sales), color: {"residual", :viridis}, radius: 6, tooltip: ["PRICE", "residual"])
+```
+
+```elixir
+points = for {b, e} <- Enum.zip(v.bins, v.experimental), e != :nan, do: %{lag: b, gamma: e}
+
+VegaLite.new(width: 520, height: 260, title: "Variograma de los residuos de XGBoost")
+|> VegaLite.data_from_values(points)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distancia (unidades de mapa)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivarianza")
+```
+
+scikit-gstat ajusta el variograma de los residuos con un alcance exponencial corto (unas 8 unidades
+de mapa, una meseta de 0,15) y sin efecto pepita, mientras que el ajuste automático de PyKrige, con
+sus clases más gruesas, solo ve efecto pepita: la estructura que queda es corta y débil, y la
+validación cruzada de la sección 3 muestra que krigearla no mejora las predicciones.
+
+## Qué hemos aprendido
+
+* El flujo híbrido son unas pocas líneas: las variables de Elixir entran en una celda Python, los
+  resultados de Python vuelven con `Pythonx.decode/1`, y la validación espacial, los variogramas, el
+  kriging y los mapas se quedan en Elixir.
+* XGBoost necesita el mismo cuidado espacial que cualquier modelo: las particiones aleatorias lo
+  premiaron por usar las coordenadas, los bloques espaciales no.
+* En esta muestra pequeña, un modelo potenciado y un modelo ridge empatan; XGBoost compensa con más
+  ventas y más características (y menos lineales), como las de las imágenes del
+  [caso satelital](caso_satelite_baltimore.livemd).

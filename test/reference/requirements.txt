@@ -1,0 +1,8 @@
+# Oracle fixture generators (dev-time only; CI never runs Python).
+#   uv venv .venv && uv pip install --python .venv/bin/python -r test/reference/requirements.txt
+scikit-gstat==1.0.24
+pykrige==1.7.3
+gstools==1.7.0
+numpy==2.5.4
+scipy==1.16.3
+pandas

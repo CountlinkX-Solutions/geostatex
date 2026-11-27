@@ -1,0 +1,255 @@
+# Use case: XGBoost in Python, geostatistics in Elixir
+
+```elixir
+geoframe_path =
+  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
+    Enum.find(
+      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
+      &(&1 && File.dir?(&1))
+    ) ||
+    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout (or put geoframe next to this repository)"
+
+Mix.install([
+  {:geostatex, path: Path.join(__DIR__, "..")},
+  {:geoframe, path: geoframe_path},
+  {:explorer, "~> 0.13"},
+  {:scholar, "~> 0.5"},
+  {:pythonx, "~> 0.4.2"},
+  {:kino_pythonx, "~> 0.1.0"},
+  {:kino, "~> 0.19"},
+  {:kino_vega_lite, "~> 0.1"}
+])
+```
+
+```pyproject.toml
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "numpy==2.1.3",
+  "scikit-learn==1.5.2",
+  "xgboost==2.1.3",
+]
+```
+
+## Setup
+
+> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
+> Run this notebook locally with a GeoFrame checkout next to Geostatex:
+>
+> ```
+> livebook server notebooks/baltimore_xgboost_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works (Elixir and Python cells):
+>
+> ```
+> elixir scripts/run_livemd.exs notebooks/baltimore_xgboost_case.livemd
+> ```
+>
+> GeoFrame is taken from `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository or
+> `SPATEX_GEOFRAME_PATH`. The Python cells run through
+> [Pythonx](https://github.com/livebook-dev/pythonx), which installs the Python packages above
+> with uv the first time. Spanish version: `notebooks/es/caso_xgboost_baltimore.livemd`.
+
+## The idea
+
+Each language does what its ecosystem does best:
+
+* **Python** trains the model: XGBoost (gradient-boosted trees), the usual winner on tabular data.
+* **Elixir** does the spatial part: the validation folds (random and by spatial blocks), the
+  variogram of the residuals and their kriging (Geostatex), and the maps (GeoFrame).
+
+Livebook passes values between the two: an Elixir variable used in a Python cell becomes a Python
+global, and what a Python cell assigns comes back to Elixir as a `Pythonx.Object`, which
+`Pythonx.decode/1` turns into Elixir data.
+
+The data are the 211 Baltimore house sales of 1978 of the [machine learning case](baltimore_ml_case.livemd),
+where ridge regression on the house features was best (RMSE of log price 0.37 with both kinds of
+folds).
+
+## 1. Data and folds (Elixir)
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Geostatex.{Kriging, Variogram}
+
+sales = [__DIR__, "data", "baltimore", "baltim.shp"] |> Path.join() |> GeoFrame.read_file!()
+data = GDF.data(sales)
+column = fn name -> data[name] |> S.cast({:f, 64}) |> S.to_list() end
+
+# The coordinates match the Maryland State Plane (NAD27, EPSG:26785) in thousands of US feet; maps
+# draw them that way, the analysis keeps the map units (1 unit = 1000 ft, about 305 m).
+on_map = fn frame ->
+  {xs, ys} = Geostatex.GeoFrame.points(frame)
+  geometry = GS.from_xy(Enum.map(xs, &(&1 * 1000)), Enum.map(ys, &(&1 * 1000)), crs: "EPSG:26785")
+  GDF.new(GDF.data(frame), geometry)
+end
+
+feature_names = ~w(SQFT LOTSZ AGE NROOM NBATH NSTOR PATIO FIREPL AC GAR BMENT DWELL CITCOU)
+y = column.("PRICE") |> Enum.map(&:math.log/1)
+xy = Enum.zip(column.("X"), column.("Y"))
+x = feature_names |> Enum.map(column) |> Enum.zip_with(& &1)
+x_and_coords = Enum.zip_with(x, xy, fn row, {a, b} -> row ++ [a, b] end)
+n = length(y)
+
+{perm, _} = Nx.Random.shuffle(Nx.Random.key(7), Nx.iota({n}))
+random_fold = perm |> Nx.to_list() |> Enum.with_index() |> Enum.sort() |> Enum.map(fn {_, i} -> rem(i, 5) end)
+
+coords = Nx.tensor(Enum.map(xy, &Tuple.to_list/1))
+kmeans = Scholar.Cluster.KMeans.fit(coords, num_clusters: 5, key: Nx.Random.key(3))
+spatial_fold = kmeans |> Scholar.Cluster.KMeans.predict(coords) |> Nx.to_list()
+
+%{sales: n, features: length(feature_names)}
+```
+
+The folds are the ones of the machine learning case: five random folds, and five spatial blocks
+found by k-means on the coordinates.
+
+## 2. XGBoost out of fold (Python)
+
+For every fold, XGBoost trains on the other four and predicts the left-out sales. For the kriging
+step it also needs residuals at the training sales that are not over-fitted, so inside each
+training set a second, inner 5-fold cross-validation gives out-of-fold training predictions.
+
+```python
+import numpy as np
+import xgboost as xgb
+
+def boosted():
+    return xgb.XGBRegressor(
+        n_estimators=300, max_depth=3, learning_rate=0.05, subsample=0.8,
+        colsample_bytree=0.8, random_state=1, n_jobs=1,
+    )
+
+def out_of_fold(rows, target, folds):
+    X, Y, folds = np.asarray(rows, dtype=float), np.asarray(target, dtype=float), np.asarray(folds)
+    test_pred = np.zeros(len(Y))
+    train_oof = []
+    for f in range(5):
+        train, test = folds != f, folds == f
+        test_pred[test] = boosted().fit(X[train], Y[train]).predict(X[test])
+        # Inner out-of-fold predictions for the training sales of this fold.
+        idx = np.flatnonzero(train)
+        inner = np.arange(len(idx)) % 5
+        oof = np.zeros(len(idx))
+        for g in range(5):
+            fit, held = inner != g, inner == g
+            oof[held] = boosted().fit(X[idx[fit]], Y[idx[fit]]).predict(X[idx[held]])
+        train_oof.append(oof.tolist())
+    return test_pred.tolist(), train_oof
+
+runs = {}
+for name, rows in [("features", x), ("features + coordinates", x_and_coords)]:
+    for scheme, folds in [("random", random_fold), ("spatial", spatial_fold)]:
+        runs[f"{name}|{scheme}"] = out_of_fold(rows, y, folds)
+
+importance = dict(zip(feature_names, boosted().fit(np.asarray(x, dtype=float), np.asarray(y)).feature_importances_.tolist()))
+```
+
+Back in Elixir, the predictions become plain data:
+
+```elixir
+runs = Pythonx.decode(runs)
+importance = Pythonx.decode(importance)
+
+importance
+|> Enum.sort_by(fn {_, v} -> -v end)
+|> Enum.map(fn {feature, gain} -> %{feature: feature, importance: gain} end)
+|> DF.new()
+```
+
+XGBoost leans most on whether the house is detached, whether it is in the county, the lot size,
+the fireplace and air conditioning.
+
+## 3. Validation and regression kriging (Elixir)
+
+The RMSE of every run, and of the same predictions plus the kriged residuals: ordinary kriging
+(PyKrige's automatic exponential variogram) of the inner out-of-fold training residuals, predicted
+at the left-out sales.
+
+```elixir
+rmse = fn preds -> :math.sqrt(Enum.sum(Enum.zip_with(preds, y, &((&1 - &2) ** 2))) / n) end
+pick = fn list, ids -> Enum.map(ids, &Enum.at(list, &1)) end
+
+kriged = fn {test_pred, train_oof}, folds ->
+  all = Enum.to_list(0..(n - 1))
+
+  corrections =
+    for f <- 0..4, reduce: %{} do
+      acc ->
+        train = Enum.filter(all, &(Enum.at(folds, &1) != f))
+        test = Enum.filter(all, &(Enum.at(folds, &1) == f))
+        residuals = Enum.zip_with(pick.(y, train), Enum.at(train_oof, f), &(&1 - &2))
+        k = Kriging.ordinary(pick.(xy, train), residuals, variogram_model: :exponential, nlags: 8)
+        {xs, ys} = test |> then(&pick.(xy, &1)) |> Enum.unzip()
+        {z, _} = Kriging.execute(k, :points, xs, ys)
+        test |> Enum.zip(z) |> Enum.into(acc)
+    end
+
+  Enum.with_index(test_pred, fn p, i -> p + corrections[i] end)
+end
+
+folds_of = %{"random" => random_fold, "spatial" => spatial_fold}
+
+results =
+  for {key, run} <- runs do
+    [name, scheme] = String.split(key, "|")
+    {test_pred, _} = run
+    %{model: "XGBoost: " <> name, validation: scheme, rmse: rmse.(test_pred), rmse_with_kriged_residuals: rmse.(kriged.(run, folds_of[scheme]))}
+  end
+
+DF.new(results) |> DF.sort_by(asc: model, asc: validation)
+```
+
+* **On the features, XGBoost is about as good as ridge regression:** 0.36 with random folds and
+  0.37 with spatial blocks (ridge: 0.37 and 0.37). With 211 sales, the trees' flexibility buys
+  little over a regularised linear model.
+* **The coordinates help only where they leak.** With them XGBoost has the best random-fold score
+  of all (0.356) and a worse spatial-block score (0.386): the trees learn places, which a new area
+  does not have.
+* **The kriged residuals change nothing** (third decimal): as for ridge, the features leave no
+  spatial structure that kriging can use.
+
+## 4. Residuals on the map
+
+The out-of-fold residuals of XGBoost on the features (spatial blocks), and their variogram:
+
+```elixir
+{spatial_pred, _} = runs["features|spatial"]
+residuals = Enum.zip_with(y, spatial_pred, &(&1 - &2))
+v = Variogram.new(xy, residuals, n_lags: 12, maxlag: 0.5, model: :exponential, use_nugget: true)
+
+sales = GDF.put(sales, "residual", residuals)
+GeoFrame.Kino.deck(on_map.(sales), color: {"residual", :viridis}, radius: 6, tooltip: ["PRICE", "residual"])
+```
+
+```elixir
+points = for {b, e} <- Enum.zip(v.bins, v.experimental), e != :nan, do: %{lag: b, gamma: e}
+
+VegaLite.new(width: 520, height: 260, title: "Variogram of the XGBoost residuals")
+|> VegaLite.data_from_values(points)
+|> VegaLite.mark(:line, point: true)
+|> VegaLite.encode_field(:x, "lag", type: :quantitative, title: "distance (map units)")
+|> VegaLite.encode_field(:y, "gamma", type: :quantitative, title: "semivariance")
+```
+
+scikit-gstat fits the residual variogram with a short exponential range (about 8 map units, a
+sill of 0.15) and no nugget, while PyKrige's automatic fit, on its coarser lags, sees only nugget:
+whatever structure is left is short and weak, and the cross-validation of section 3 shows that
+kriging it does not improve the predictions.
+
+## What we learned
+
+* The hybrid workflow is a few lines: Elixir variables go into a Python cell, the Python results
+  come back with `Pythonx.decode/1`, and the spatial validation, variograms, kriging and maps stay
+  in Elixir.
+* XGBoost needs the same spatial care as any model: random folds rewarded it for using the
+  coordinates, spatial blocks did not.
+* On this small sample a boosted model and a ridge model tie; XGBoost pays off with more sales and
+  more (and more non-linear) features, such as those of images in the
+  [satellite case](baltimore_satellite_case.livemd).
