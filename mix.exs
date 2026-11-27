@@ -60,6 +60,7 @@ defmodule Geostatex.MixProject do
         ],
         "docs/architecture.md": [title: "Architecture"],
         "docs/parity.md": [title: "Parity"],
+        "CONTRIBUTING.md": [title: "Contributing"],
         LICENSE: [title: "License (LGPL-3.0)"],
         COPYING: [title: "GNU General Public License"],
         NOTICE: [title: "Notice"]
