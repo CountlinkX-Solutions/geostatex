@@ -2,35 +2,26 @@
 
 ## Setup
 
-> **Not run in CI.** GeoFrame is a private sibling project, so GitHub Actions cannot fetch it.
-> Run this notebook locally with a GeoFrame checkout:
+> Run this notebook from a checkout of Geostatex (it reads the data under `notebooks/data`):
 >
 > ```
-> GEOSTATEX_GEOFRAME_PATH=/path/to/geoframe livebook server notebooks/meuse_case.livemd
+> livebook server notebooks/meuse_case.livemd
 > ```
 >
 > or headlessly, to check that every cell works:
 >
 > ```
-> GEOSTATEX_GEOFRAME_PATH=/path/to/geoframe elixir scripts/run_livemd.exs notebooks/meuse_case.livemd
+> elixir scripts/run_livemd.exs notebooks/meuse_case.livemd
 > ```
 >
-> Without `GEOSTATEX_GEOFRAME_PATH`, `../geoframe` next to this repository is used (or
-> `SPATEX_GEOFRAME_PATH`).
 > Spanish version: `notebooks/es/caso_mosa.livemd`.
 
 ```elixir
-geoframe_path =
-  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
-    Enum.find(
-      [Path.expand(Path.join(__DIR__, "../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
-      &(&1 && File.dir?(&1))
-    ) ||
-    raise "set GEOSTATEX_GEOFRAME_PATH to a GeoFrame checkout before starting this notebook (or put geoframe next to this repository)"
-
 Mix.install([
   {:geostatex, path: Path.join(__DIR__, "..")},
-  {:geoframe, path: geoframe_path},
+  # A checkout builds the NIF from source, which needs Rustler and a Rust toolchain.
+  {:rustler, "~> 0.38", runtime: false},
+  {:geoframe, "~> 0.3.3"},
   {:explorer, "~> 0.13"},
   {:kino, "~> 0.19"},
   {:kino_vega_lite, "~> 0.1"}

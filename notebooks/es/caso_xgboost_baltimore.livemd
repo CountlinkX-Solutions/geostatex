@@ -1,17 +1,11 @@
 # Caso de uso: XGBoost en Python, geoestadística en Elixir
 
 ```elixir
-geoframe_path =
-  System.get_env("GEOSTATEX_GEOFRAME_PATH") ||
-    Enum.find(
-      [Path.expand(Path.join(__DIR__, "../../../geoframe")), System.get_env("SPATEX_GEOFRAME_PATH")],
-      &(&1 && File.dir?(&1))
-    ) ||
-    raise "define GEOSTATEX_GEOFRAME_PATH con una copia de GeoFrame (o pon geoframe junto a este repositorio)"
-
 Mix.install([
   {:geostatex, path: Path.join(__DIR__, "../..")},
-  {:geoframe, path: geoframe_path},
+  # A checkout builds the NIF from source, which needs Rustler and a Rust toolchain.
+  {:rustler, "~> 0.38", runtime: false},
+  {:geoframe, "~> 0.3.3"},
   {:explorer, "~> 0.13"},
   {:scholar, "~> 0.5"},
   {:pythonx, "~> 0.4.2"},
@@ -35,8 +29,8 @@ dependencies = [
 
 ## Preparación
 
-> **No se ejecuta en CI.** GeoFrame es un proyecto hermano privado, así que GitHub Actions no
-> puede descargarlo. Ejecuta este cuaderno en local con una copia de GeoFrame junto a Geostatex:
+> Ejecuta este cuaderno desde una copia del repositorio de Geostatex (lee los datos de
+> `notebooks/data`):
 >
 > ```
 > livebook server notebooks/es/caso_xgboost_baltimore.livemd
@@ -48,8 +42,7 @@ dependencies = [
 > elixir scripts/run_livemd.exs notebooks/es/caso_xgboost_baltimore.livemd
 > ```
 >
-> GeoFrame se toma de `GEOSTATEX_GEOFRAME_PATH`, de `../geoframe` junto a este repositorio o de
-> `SPATEX_GEOFRAME_PATH`. Las celdas Python se ejecutan con
+> Las celdas Python se ejecutan con
 > [Pythonx](https://github.com/livebook-dev/pythonx), que instala los paquetes de Python de arriba con
 > uv la primera vez. Versión en inglés: `notebooks/baltimore_xgboost_case.livemd`.
 

@@ -119,17 +119,9 @@ defmodule Geostatex.MixProject do
       # environment, so it cannot be test-only here; optional keeps it away from users.
       {:jason, "~> 1.4", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false}
-    ] ++ geoframe_dep()
-  end
-
-  # GeoFrame is not on Hex yet, so CI cannot fetch it and the lock never lists it: the
-  # dependency exists only when GEOSTATEX_GEOFRAME_PATH points at a checkout.
-  # Geostatex.GeoFrame calls it at runtime, so nothing here is needed to compile Geostatex.
-  defp geoframe_dep do
-    case System.get_env("GEOSTATEX_GEOFRAME_PATH") do
-      path when path in [nil, ""] -> []
-      path -> [{:geoframe, path: path, only: :test, optional: true}]
-    end
+      {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
+      # Geostatex.GeoFrame calls GeoFrame at runtime only; the dependency exists to test it.
+      {:geoframe, "~> 0.3.3", only: :test}
+    ]
   end
 end

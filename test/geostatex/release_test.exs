@@ -58,6 +58,22 @@ defmodule Geostatex.ReleaseTest do
       refute readme =~ "odd/"
     end
 
+    test "notebooks and tests take GeoFrame from Hex" do
+      assert {:geoframe, "~> 0.3.3", only: :test} in Mix.Project.config()[:deps]
+
+      for notebook <- Path.wildcard(Path.join(@root, "notebooks/**/*.livemd")) do
+        text = File.read!(notebook)
+
+        assert text =~ ~s({:geoframe, "~> 0.3.3"}),
+               "#{notebook} does not install GeoFrame from Hex"
+
+        refute text =~ "GEOFRAME_PATH", "#{notebook} still asks for a GeoFrame checkout"
+
+        # Geostatex comes from the checkout, built from source: Rustler is optional, so ask for it.
+        assert text =~ ~s({:rustler, "~> 0.38", runtime: false}), "#{notebook} lacks Rustler"
+      end
+    end
+
     test "every package entry exists, so mix hex.build cannot report missing files", %{
       files: files
     } do
